@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Browser Tools Fixture</title></head>
+<body>
+  <main>
+    <h1>BROWSER TOOLS FIXTURE</h1>
+    <button id="replace">Replace target</button>
+    <button id="target">Target 1</button>
+    <div id="custom-login" class="login-button">Custom login</div>
+    <input id="text" aria-label="Text field">
+    <input id="privacy-password" type="password" autocomplete="current-password" aria-label="Password">
+    <input id="privacy-otp" inputmode="numeric" autocomplete="one-time-code" aria-label="OTP verification code">
+    <div id="paste-target" contenteditable="true" aria-label="Paste target" style="min-height:24px">Paste here</div>
+    <div id="privacy-challenge" contenteditable="true" data-dsh-sensitive="security-challenge" aria-label="Security challenge answer" style="min-height:24px"></div>
+    <select id="select" aria-label="Choice"><option value="a">A</option><option value="b">B</option></select>
+    <button id="dialog">Open dialog</button>
+    <button id="diagnostic-error">Trigger diagnostic error</button>
+    <div id="inspect-occlusion-stage" style="position:relative;width:220px;height:48px">
+      <button id="occluded-target" aria-label="Occluded target" style="width:220px;height:48px">Occluded target</button>
+      <div id="transparent-overlay" style="position:absolute;inset:0;z-index:10;opacity:0.01;pointer-events:auto"></div>
+    </div>
+    <canvas id="diagnostic-canvas" role="img" aria-label="Diagnostic canvas" width="300" height="150" style="width:150px;height:75px"></canvas>
+    <div id="l3-workflow-root" data-dsh-application="Workflow Designer">
+      <div id="l3-shadow-host"></div>
+      <span id="l3-shadow-slotted" slot="surface-slot">Slotted surface</span>
+    </div>
+    <button id="l3-shadow-rebuild">Rebuild shadow root</button>
+    <div id="l3-release-root" data-dsh-application="Release Center" data-dsh-application-kind="module-federation" data-remote-entry="/remoteEntry.js"><button id="l3-release-action" aria-label="L3 Release action">Release action</button></div>
+    <div id="l3-incomplete-remote" data-dsh-application="Incomplete Remote" data-dsh-application-kind="module-federation"></div>
+    <div id="l3-closed-shadow-host" aria-label="Closed shadow host"></div>
+    <svg id="l3-svg" aria-label="L3 SVG surface" viewBox="0 0 100 50" preserveAspectRatio="xMidYMid meet" width="240" height="120" style="transform:translate(4px, 3px)">
+      <g transform="translate(10 5) scale(2)"><rect id="l3-svg-target" role="button" aria-label="L3 SVG target" x="2" y="3" width="20" height="10" fill="rgb(10, 20, 30)" stroke="rgb(200, 100, 50)" pointer-events="all"></rect></g>
+    </svg>
+    <canvas id="l3-canvas" role="img" aria-label="L3 Canvas surface" width="360" height="180" style="width:180px;height:90px"></canvas>
+    <div id="portal-root" role="dialog" aria-label="Diagnostic portal" style="position:fixed;right:8px;bottom:8px;z-index:20;width:180px;height:60px;background:white">Portal content</div>
+    <a id="popup" href="/?popup=1" target="_blank" rel="noreferrer">Open popup tab</a>
+    <pre id="result"></pre>
+  </main>
+  <script>
+    let generation = 1
+    const bind = target => target.addEventListener('click', () => { document.querySelector('#result').textContent = `clicked-${generation}` })
+    bind(document.querySelector('#target'))
+    document.querySelector('#custom-login').addEventListener('click', () => { document.querySelector('#result').textContent = 'custom-login-clicked' })
+    document.querySelector('#paste-target').addEventListener('paste', event => {
+      event.preventDefault()
+      const files = [...event.clipboardData.files]
+      globalThis.__pasteFixture = {
+        text: event.clipboardData.getData('text/plain'),
+        html: event.clipboardData.getData('text/html'),
+        uriList: event.clipboardData.getData('text/uri-list'),
+        files: files.map(file => ({ name: file.name, type: file.type, size: file.size })),
+      }
+    })
+    document.querySelector('#replace').addEventListener('click', () => {
+      generation += 1
+      const target = document.createElement('button')
+      target.id = 'target'
+      target.textContent = `Target ${generation}`
+      bind(target)
+      document.querySelector('#target').replaceWith(target)
+    })
+    document.querySelector('#dialog').addEventListener('click', () => { document.querySelector('#result').textContent = confirm('fixture-confirm') ? 'accepted' : 'dismissed' })
+    const mountShadow = () => {
+      const old = document.querySelector('#l3-shadow-host')
+      const slotted = old.querySelector('#l3-shadow-slotted') || document.querySelector('#l3-shadow-slotted')
+      const host = old.cloneNode(false)
+      old.replaceWith(host)
+      const root = host.attachShadow({ mode: 'open' })
+      root.innerHTML = '<button id="l3-shadow-target" aria-label="L3 Shadow target"><slot name="surface-slot"></slot>Shadow action</button>'
+      host.append(slotted)
+    }
+    mountShadow()
+    document.querySelector('#l3-shadow-rebuild').addEventListener('click', mountShadow)
+    const closedRoot = document.querySelector('#l3-closed-shadow-host').attachShadow({ mode: 'closed' })
+    closedRoot.innerHTML = '<button>Closed internal</button>'
+    const canvasContext = document.querySelector('#l3-canvas').getContext('2d')
+    canvasContext.fillStyle = '#336699'
+    canvasContext.fillRect(0, 0, 360, 180)
+    setInterval(() => { globalThis.__browserToolsHeartbeat = Date.now() }, 25)
+    console.info('fixture-ready')
+    //# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJzb3VyY2VzIjpbImZpeHR1cmUudHMiXSwibmFtZXMiOltdLCJtYXBwaW5ncyI6IiIsInNvdXJjZXNDb250ZW50IjpbImZpeHR1cmUgc291cmNlIG1hcCJdfQ==
+  </script>
+  <script src="/diagnostic-app.js"></script>
+</body>
+</html>

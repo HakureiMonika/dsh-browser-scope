@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict'
+import { BuildRegistry } from '../src/build-registry.ts'
+
+const registry = new BuildRegistry()
+const base = { viewId: 'v1', documentGeneration: 1, navigationId: 'v1-n1', targetId: 't1', frameId: 'f1', frameDocumentGeneration: 1, startLine: 0, startColumn: 0, endLine: 10, endColumn: 0, loadedAt: 1, active: true }
+registry.registerScript('a@1', { ...base, scriptId: 's1', url: 'https://app.test/app.js' })
+const buildA = registry.bindSource('a@1', 's1', { source: 'console.log("A")', sourceMapUrl: 'https://app.test/app.js.map', sourceMap: { version: 3, mappings: 'AAAA' } })
+registry.registerScript('a@1', { ...base, scriptId: 's2', url: 'https://app.test/app.js' })
+const buildB = registry.bindSource('a@1', 's2', { source: 'console.log("B")', sourceMapUrl: 'https://app.test/app.js.map', sourceMap: { version: 3, mappings: 'AACA' } })
+assert.notEqual(buildA.buildId, buildB.buildId)
+assert.equal(registry.selectScript('a@1', { viewId: 'v1', documentGeneration: 1, url: 'https://app.test/app.js', targetId: 't1', frameId: 'f1' }).status, 'ambiguous')
+registry.deactivateScript('a@1', 's1')
+assert.equal(registry.selectScript('a@1', { viewId: 'v1', documentGeneration: 1, url: 'https://app.test/app.js', targetId: 't1', frameId: 'f1' }).script?.scriptId, 's2')
+assert.equal(registry.snapshot('a@1').builds.find(build => build.buildId === buildA.buildId)?.active, false)
+registry.registerScript('a@1', { ...base, scriptId: 's-context', url: 'https://app.test/context.js', executionContextId: 91 })
+const contextBuild = registry.bindSource('a@1', 's-context', { source: 'console.log("context")' })
+registry.deactivateExecutionContext('a@1', 91)
+assert.equal(registry.snapshot('a@1').builds.find(build => build.buildId === contextBuild.buildId)?.active, false)
+registry.registerScript('a@1', { ...base, scriptId: 's-target', url: 'https://app.test/target.js', targetId: 'target-child' })
+const targetBuild = registry.bindSource('a@1', 's-target', { source: 'console.log("target")' })
+registry.deactivateTarget('a@1', 'target-child')
+assert.equal(registry.snapshot('a@1').builds.find(build => build.buildId === targetBuild.buildId)?.active, false)
+registry.invalidateDocument('a@1', 'v1', 2)
+assert.equal(registry.snapshot('a@1').builds.every(build => build.active === false), true)
+registry.registerScript('a@1', { ...base, scriptId: 's3', documentGeneration: 2, navigationId: 'v1-n2', url: 'https://app.test/app.js' })
+registry.bindSource('a@1', 's3', { source: 'console.log("C")', sourceMapUrl: 'https://app.test/app.js.map', sourceMap: { version: 3, mappings: 'AAGA' } })
+assert.equal(registry.selectScript('a@1', { viewId: 'v1', documentGeneration: 2, url: 'https://app.test/app.js' }).script?.scriptId, 's3')
+registry.migrateSession('a@1', 'a@2')
+assert.equal(registry.snapshot('a@2').builds.length, 5)
+
+process.stdout.write(`${JSON.stringify({ ok: true, sameUrlDistinctBuilds: true, ambiguousFailsClosed: true, scriptLifecycle: true, executionContextLifecycle: true, targetLifecycle: true, staleBuildInactive: true, currentDocumentSelected: true, migrated: true }, null, 2)}\n`)
