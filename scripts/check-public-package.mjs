@@ -15,26 +15,33 @@ const expectedFiles = [
   'package.json',
 ].sort()
 
-// 通过 Node 执行 npm CLI，确保 Windows 与 GitHub Linux Runner 使用同一套结构化预览检查。
+// 优先复用 npm 提供的 CLI 入口；直接通过 Node 启动脚本时，则回退到系统 PATH 中的 npm。
+// Windows 的 npm 是 .cmd 包装器，必须经 shell 启动；Linux/macOS 可直接执行 npm。
 const npmCli = [
   process.env.npm_execpath,
   join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
 ].filter(value => typeof value === 'string' && value !== '')
   .find(existsSync)
-if (npmCli === undefined) {
-  throw new Error('npm CLI could not be located')
-}
-const preview = spawnSync(process.execPath, [
-  npmCli,
+const packArgs = [
   'pack',
   '--ignore-scripts',
   '--dry-run',
   '--json',
-], {
+]
+const npmCommand = npmCli === undefined
+  ? process.platform === 'win32'
+    ? 'npm.cmd'
+    : 'npm'
+  : process.execPath
+const npmArgs = npmCli === undefined
+  ? packArgs
+  : [npmCli, ...packArgs]
+const preview = spawnSync(npmCommand, npmArgs, {
   cwd: projectRoot,
   env: process.env,
   encoding: 'utf8',
   windowsHide: true,
+  shell: npmCli === undefined && process.platform === 'win32',
 })
 if (preview.error !== undefined || preview.status !== 0) {
   throw new Error(`npm pack preview failed\nspawnError=${preview.error?.message ?? 'none'}\nstdout=${preview.stdout ?? ''}\nstderr=${preview.stderr ?? ''}`)
