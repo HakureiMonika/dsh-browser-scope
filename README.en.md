@@ -40,7 +40,9 @@ Furthermore, BrowserScope ensures safe multi-plugin coexistence, tailored for DS
   - [Live View & Manual Takeover](#live-view--manual-takeover)
   - [Extensions & Environment](#extensions--environment)
   - [Session Arbitration](#session-arbitration)
-- [Technical Specs](#technical-specs)
+- [Technical Specs (TECHNICAL.en.md)](./TECHNICAL.en.md)
+- [Validation Report (VALIDATION.en.md)](./VALIDATION.en.md)
+- [简体中文 (README.md)](./README.md)
 - [Compatibility](#compatibility)
 - [Feedback & Issues](#feedback--issues)
 - [License](#license)
@@ -248,6 +250,10 @@ When upgrading from the legacy `dsh-browser-tools` package, remove the previous 
 ## Technical Specs
 
 For complete schema definitions, controller state machines, security invariants, and RPC contracts, see [TECHNICAL.en.md](./TECHNICAL.en.md).
+
+## Validation Report
+
+For comprehensive multi-environment empirical test results, see [VALIDATION.en.md](./VALIDATION.en.md).
 
 ## Compatibility
 

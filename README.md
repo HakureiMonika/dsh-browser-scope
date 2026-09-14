@@ -41,6 +41,8 @@ BrowserScope 在 DSH Web 右侧栏嵌入一个完整的 Chromium 工作台，配
   - [扩展与浏览器环境](#扩展与浏览器环境)
   - [Session 控制](#session-控制)
 - [技术细节](#技术细节)
+- [测试报告 (VALIDATION.md)](./VALIDATION.md)
+- [English Version (README.en.md)](./README.en.md)
 - [兼容范围](#兼容范围)
 - [使用反馈](#使用反馈)
 - [License](#license)
@@ -280,6 +282,10 @@ dsh plugin --profile web add ./dsh-browser-scope-1.0.0-rc2.tgz --ignore-scripts 
 ## 技术细节
 
 完整配置、工具注册模式、状态模型、安全边界、内部标识和工具清单见 [TECHNICAL.md](./TECHNICAL.md)。
+
+## 测试报告
+
+多环境真实工况实测记录见 [VALIDATION.md](./VALIDATION.md)。
 
 ## 兼容范围
 
