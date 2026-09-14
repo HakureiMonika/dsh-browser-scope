@@ -43,6 +43,8 @@
     "cordis.patch.yml",
     "README.md",
     "README.en.md",
+    "SECURITY.md",
+    "SECURITY.en.md",
     "TECHNICAL.md",
     "TECHNICAL.en.md",
     "VALIDATION.md",

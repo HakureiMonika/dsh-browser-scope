@@ -1,5 +1,7 @@
 # 安全策略
 
+[English Version](./SECURITY.en.md) | 简体中文
+
 ## 支持范围
 
 当前支持的公开候选版本是 `1.0.0-rc2`。

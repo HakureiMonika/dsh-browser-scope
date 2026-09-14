@@ -12,6 +12,8 @@ const expectedFiles = [
   'LICENSE',
   'README.en.md',
   'README.md',
+  'SECURITY.en.md',
+  'SECURITY.md',
   'TECHNICAL.en.md',
   'TECHNICAL.md',
   'VALIDATION.en.md',

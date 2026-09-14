@@ -271,7 +271,7 @@ Candidate identity is anchored by external `candidate-identity.json` and tarball
 
 For bugs, compatibility issues, or feature requests, please submit an issue on [GitHub Issues](https://github.com/HakureiMonika/dsh-browser-scope/issues). Include your DSH version, BrowserScope version, OS, Node.js version, and any co-installed browser plugins.
 
-Security vulnerabilities should be reported privately according to our [Security Policy](./SECURITY.md). Never submit credentials, cookies, or raw session logs in public channels.
+Security vulnerabilities should be reported privately according to our [Security Policy](./SECURITY.en.md). Never submit credentials, cookies, or raw session logs in public channels.
 
 ## License
 
