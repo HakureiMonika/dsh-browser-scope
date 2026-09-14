@@ -1,13 +1,18 @@
 .control { position: relative; display: inline-flex; align-items: center; gap: 6px; }
 .controllerBadge { max-width: 150px; overflow: hidden; color: var(--dsw-alias-text-secondary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .controllerBadge[data-active] { color: var(--dsw-alias-accent, #4c8dff); }
-.controllerStatus, .controllerTools { padding: 4px 6px; color: var(--dsw-alias-text-secondary); font-size: 11px; overflow-wrap: anywhere; }
+.controllerStatus { padding: 4px 6px; color: var(--dsw-alias-text-secondary); font-size: 11px; overflow-wrap: anywhere; }
+.controllerToolsMenu { position: absolute; right: 0; bottom: 34px; z-index: 101; width: min(320px, calc(100vw - 24px)); max-height: min(420px, calc(100vh - 72px)); display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; color: var(--dsw-alias-text-primary); background: var(--dsw-alias-bg-base); border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; box-shadow: 0 8px 28px #0008; }
+.controllerToolsHeader { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 8px; border-bottom: 1px solid var(--dsw-alias-border-l2); font-size: 11px; }
+.controllerToolsHeader button { padding: 1px 6px; }
+.controllerToolsList { min-height: 0; display: grid; align-content: start; gap: 4px; margin: 0; padding: 7px; overflow: auto; list-style: none; }
+.controllerToolsList > span { min-width: 0; padding: 5px 7px; overflow-wrap: anywhere; color: var(--dsw-alias-text-secondary); background: var(--dsw-alias-button-ghost-fill); border-radius: 6px; font: 11px/1.4 ui-monospace, monospace; }
 .controllerConfirm { display: grid; gap: 6px; padding: 6px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 7px; font-size: 11px; line-height: 1.45; }
 .controllerConfirm > span { color: var(--dsw-alias-text-secondary); }
 .controllerActions { display: grid; gap: 4px; }
-.controlButton, .menu button, .actions button, .breakpoint button, .debuggerBody button, .panel header button, .toolbar button, .liveControlPanel button, .item button, .navigationBar button, .newTab, .errorMessage button, .extensionConfirmDialog button, .extensionMenu button, .extensionPopupWindow button { color: var(--dsw-alias-text-primary); background: var(--dsw-alias-button-ghost-fill); border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; padding: 3px 6px; cursor: pointer; }
+.controlButton, .menu button, .controllerToolsMenu button, .actions button, .breakpoint button, .debuggerBody button, .panel header button, .toolbar button, .liveControlPanel button, .item button, .navigationBar button, .newTab, .errorMessage button, .extensionConfirmDialog button, .extensionMenu button, .extensionPopupWindow button { color: var(--dsw-alias-text-primary); background: var(--dsw-alias-button-ghost-fill); border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; padding: 3px 6px; cursor: pointer; }
 .controlMessage { max-width: 260px; overflow: hidden; color: var(--dsw-alias-text-secondary); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.menu { position: absolute; right: 0; bottom: 34px; z-index: 100; display: grid; min-width: 170px; padding: 6px; gap: 4px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-base); box-shadow: 0 8px 28px #0008; }
+.menu { position: absolute; right: 0; bottom: 34px; z-index: 100; display: grid; min-width: 190px; max-height: min(520px, calc(100vh - 72px)); padding: 6px; gap: 4px; overflow-y: auto; overflow-x: hidden; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-base); box-shadow: 0 8px 28px #0008; }
 .menu button { text-align: left; }
 .menu button[data-selected] { background: var(--dsw-alias-button-ghost-hover); }
 .panel { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; color: var(--dsw-alias-text-primary); background: var(--dsw-alias-bg-base); border-left: 1px solid var(--dsw-alias-border-l2); }
@@ -40,8 +45,10 @@
 .splitLive { min-width: 0; min-height: 0; display: grid; overflow: hidden; background: #111; }
 .livePane { min-width: 0; min-height: 0; display: grid; overflow: hidden; box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l2); }
 .livePane[data-focused] { box-shadow: inset 0 0 0 2px var(--dsw-alias-accent, #4c8dff); }
-.splitDivider { min-height: 6px; cursor: row-resize; touch-action: none; background: var(--dsw-alias-border-l2); border-top: 2px solid #111; border-bottom: 2px solid #111; }
-.splitDivider:hover { background: var(--dsw-alias-accent, #4c8dff); }
+.splitDivider { min-width: 6px; min-height: 6px; touch-action: none; background: var(--dsw-alias-border-l2); }
+.splitDivider[data-orientation="top-bottom"] { cursor: row-resize; border-top: 2px solid #111; border-bottom: 2px solid #111; }
+.splitDivider[data-orientation="left-right"] { cursor: col-resize; border-left: 2px solid #111; border-right: 2px solid #111; }
+.splitDivider:hover, .splitDivider:focus-visible { background: var(--dsw-alias-accent, #4c8dff); }
 .live { min-width: 0; min-height: 0; width: 100%; height: 100%; max-width: 100%; max-height: 100%; display: block; object-fit: contain; outline: none; background: #111; user-select: none; -webkit-user-drag: none; }
 .live[data-takeover] { cursor: default; }
 .live[data-share-drag] { cursor: grab; -webkit-user-drag: element; }
@@ -93,9 +100,6 @@
 .liveControlActions button[data-selected] { background: var(--dsw-alias-button-ghost-hover); box-shadow: inset 2px 0 0 var(--dsw-alias-accent, #4c8dff); }
 .toolbar input { min-width: 110px; flex: 1 1 140px; color: var(--dsw-alias-text-primary); background: var(--dsw-alias-bg-base); border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 6px 8px; }
 .toolbar button:disabled { cursor: not-allowed; opacity: .5; }
-.outerDivider { position: fixed; z-index: 900; width: 9px; margin-left: -4px; cursor: col-resize; touch-action: none; background: transparent; }
-.outerDivider::after { content: ''; position: absolute; top: 0; bottom: 0; left: 4px; width: 1px; background: var(--dsw-alias-border-l2); }
-.outerDivider:hover::after { width: 2px; background: var(--dsw-alias-accent, #4c8dff); }
 .domainPanel { min-height: 0; display: grid; align-content: start; overflow: auto; }
 .diagnosticPanel { min-height: 0; display: grid; align-content: start; overflow: auto; }
 .diagnosticPanel section { min-width: 0; padding: 10px; border-bottom: 1px solid var(--dsw-alias-border-l2); }

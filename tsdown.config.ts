@@ -115,7 +115,9 @@ const client: UserConfig = {
         resolve(PROJECT_ROOT, stablePath)
       this.addWatchFile(file)
       const result = transform({
-        filename: file,
+        // CSS Modules Hash 必须只依赖仓库相对路径和 CSS 内容，不能包含维护者或公开副本的绝对目录。
+        // 否则同一源码在不同检出路径构建会产生不同类名，破坏候选与公开 CI 的逐字节一致性。
+        filename: stablePath,
         code: await readFile(file),
         cssModules: { pattern: '[hash]_[local]' },
         minify: true,

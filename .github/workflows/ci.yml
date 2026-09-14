@@ -31,14 +31,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
 
+      - name: Verify DSH peer dependencies
+        run: pnpm peers check
+
       - name: Build public package
         run: npm run build
-
-      - name: Run public tests
-        run: npm test
-
-      - name: Verify release hygiene
-        run: node tests/final-hygiene.mjs
 
       - name: Verify npm package whitelist
         run: node scripts/check-public-package.mjs

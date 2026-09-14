@@ -71,8 +71,7 @@ class FakeToolSurface {
     const inherited = new Set(this.globals.keys())
     const unknown = deny.filter(name => !inherited.has(name))
     if (unknown.length > 0) throw new Error(`unknown inherited tools: ${unknown.join(',')}`)
-    const set = new Set(deny)
-    this.restrictions.set(agent, set)
+    this.restrictions.set(agent, new Set(deny))
     return () => { this.restrictions.delete(agent) }
   }
 
@@ -127,6 +126,30 @@ function fakeAgent(id: string, surface: FakeToolSurface): Agent & { notices: str
   }) as unknown as Agent & { notices: string[]; readonly preStep?: () => Promise<unknown> }
 }
 
+function createStore(
+  root: string,
+  surface: FakeToolSurface,
+  owned: readonly ToolDefinition[],
+  released: string[] = [],
+  registerTools: (agent: Agent, definitions: readonly ToolDefinition[]) => () => void =
+    (agent, definitions) => surface.register(agent, definitions),
+): BrowserControllerStore {
+  const ctx = { tools: { schemas: (agent?: Agent) => surface.schemas(agent) } } as unknown as Context
+  return new BrowserControllerStore({
+    ctx,
+    storageRoot: root,
+    config: {
+      conflictingToolPatterns: ['^browser_'],
+      includeTools: [],
+      excludeTools: [],
+    },
+    toolDefinitions: owned,
+    registerTools,
+    releaseRuntime: async sessionId => { released.push(sessionId) },
+    isOwnedTool: name => owned.some(value => value.name === name),
+  })
+}
+
 const runtimeRoot = join(process.cwd(), '.runtime', 'browser-controller-test')
 await rm(runtimeRoot, { recursive: true, force: true })
 await mkdir(runtimeRoot, { recursive: true })
@@ -140,277 +163,212 @@ try {
     definition('browser_snapshot', 'dsh-browser-tools-snapshot'),
     definition('browser_tabs', 'dsh-browser-tools-tabs'),
   ]
-  const suspended: string[] = []
+
+  // 新 Session 尚未选择时，当前 Agent Scope 暂时看不到浏览器工具；普通工具继续可用。
   const released: string[] = []
-  const ctx = { tools: { schemas: (agent?: Agent) => surface.schemas(agent) } } as unknown as Context
-  const store = new BrowserControllerStore({
-    ctx,
-    storageRoot: runtimeRoot,
-    config: {
-      defaultMode: 'other',
-      conflictingToolPatterns: ['^browser_'],
-      includeTools: [],
-      excludeTools: [],
-    },
-    toolDefinitions: owned,
-    registerTools: (agent, definitions) => surface.register(agent, definitions),
-    suspendRuntime: async sessionId => { suspended.push(sessionId) },
-    releaseRuntime: async sessionId => { released.push(sessionId) },
-    isOwnedTool: name => owned.some(value => value.name === name),
-  })
+  const store = createStore(runtimeRoot, surface, owned, released)
+  const browserScopeAgent = fakeAgent('session-browser-scope', surface)
+  const otherAgent = fakeAgent('session-other', surface)
+  const siblingAgent = fakeAgent('session-sibling', surface)
+  store.attach(browserScopeAgent)
+  store.attach(otherAgent)
+  store.attach(siblingAgent)
+  await browserScopeAgent.preStep?.()
+  await otherAgent.preStep?.()
+  await siblingAgent.preStep?.()
 
-  const first = fakeAgent('session-a', surface)
-  const second = fakeAgent('session-b', surface)
-  store.attach(first)
-  store.attach(second)
-  await first.preStep?.()
-  await second.preStep?.()
+  const initial = store.snapshot('session-browser-scope')
+  assert(initial.mode === 'unselected' && initial.selectionLocked === false, '新 Session 应处于尚未选择状态')
+  assert(!surface.schemas(browserScopeAgent).some(value => value.name.startsWith('browser_')), '尚未选择时不应暴露浏览器工具')
+  assert(surface.schemas(browserScopeAgent).some(value => value.name === 'read'), '尚未选择时不应影响普通工具')
 
-  assert(surface.schemas(first).find(value => value.name === 'browser_snapshot')?.description === 'third-party-snapshot', 'other 模式不应遮蔽第三方同名工具')
-  assert(surface.schemas(first).some(value => value.name === 'browser_auth'), 'other 模式不应限制第三方独有工具')
+  // 选择 BrowserScope 后永久锁定：本插件工具可用，第三方浏览器工具只在当前 Session 隐藏。
+  const active = await store.activate('session-browser-scope')
+  assert(active.status === 'active' && active.mode === 'dsh-browser-tools', '选择 BrowserScope 后状态不正确')
+  assert(active.selectionLocked === true && active.generation === 1, 'BrowserScope 选择没有永久锁定')
+  assert(surface.schemas(browserScopeAgent).find(value => value.name === 'browser_snapshot')?.description === 'dsh-browser-tools-snapshot', '本插件同名工具没有接管当前 Session')
+  assert(!surface.schemas(browserScopeAgent).some(value => value.name === 'browser_auth'), '第三方独有浏览器工具没有在当前 Session 隐藏')
+  assert(surface.schemas(siblingAgent).find(value => value.name === 'browser_snapshot')?.description === undefined, '尚未选择的兄弟 Session 不应提前暴露第三方浏览器工具')
 
-  const active = await store.activate('session-a')
-  assert(active.status === 'active' && active.mode === 'dsh-browser-tools', '激活后控制器状态不正确')
-  assert(active.generation === 1, '首次激活应递增 generation')
-  assert(active.shadowedTools.includes('browser_snapshot'), '同名工具没有进入 shadow 集')
-  assert(active.restrictedTools.includes('browser_auth'), '第三方独有工具没有进入 restriction 集')
-  assert(surface.schemas(first).find(value => value.name === 'browser_snapshot')?.description === 'dsh-browser-tools-snapshot', 'Agent 层同名工具没有遮蔽第三方工具')
-  assert(!surface.schemas(first).some(value => value.name === 'browser_auth'), '第三方独有浏览器工具没有被限制')
-  assert(surface.schemas(second).find(value => value.name === 'browser_snapshot')?.description === 'third-party-snapshot', '另一个 Session 的第三方同名工具受到影响')
-  assert(surface.schemas(second).some(value => value.name === 'browser_auth'), '另一个 Session 的第三方独有工具受到影响')
-  assert(store.ownsExecution('session-a', 'browser_snapshot'), '激活 Session 的工具所有权未建立')
-  assert(!store.ownsExecution('session-b', 'browser_snapshot'), '未激活 Session 被错误判为本插件所有')
-
-  const inactive = await store.deactivate('session-a')
-  assert(inactive.status === 'inactive' && inactive.mode === 'other', '退出后状态不正确')
-  assert(inactive.generation === 2, '退出应递增 generation')
-  assert(suspended.join(',') === 'session-a', '默认退出没有调用安全挂起')
-  assert(surface.schemas(first).find(value => value.name === 'browser_snapshot')?.description === 'third-party-snapshot', '退出后第三方同名工具没有恢复')
-  assert(surface.schemas(first).some(value => value.name === 'browser_auth'), '退出后第三方独有工具没有恢复')
-
-  await store.activate('session-a')
-  await store.deactivate('session-a', true)
-  assert(released.join(',') === 'session-a', '释放退出没有调用 Session 资源清理')
-
-  const persistedFiles = await import('node:fs/promises').then(fs => fs.readdir(runtimeRoot))
-  assert(persistedFiles.length === 1, 'Session 模式持久化文件数量不正确')
-  const persisted = JSON.parse(await readFile(join(runtimeRoot, persistedFiles[0] as string), 'utf8')) as { mode?: string; generation?: number }
-  assert(persisted.mode === 'other' && persisted.generation === 4, '持久化模式或 generation 不正确')
-
-  // 已退出 Session 的重复退出必须幂等，不能再次递增 generation 或重复释放 Runtime 资源。
-  const repeatedInactive = await store.deactivate('session-a', true)
-  assert(repeatedInactive.generation === 4, '重复退出错误递增了 generation')
-  assert(released.length === 1, '重复退出错误重复释放了 Runtime 资源')
-
-  // 冷恢复只重建 scoped 工具面，必须沿用持久 generation，不能把恢复本身解释为新一次控制器切换。
-  const recoveryRoot = join(runtimeRoot, 'recovery')
-  const recoverySessionId = 'session-restored'
-  const recoveryPath = join(recoveryRoot, `${createHash('sha256').update(recoverySessionId).digest('hex')}.json`)
-  await mkdir(recoveryRoot, { recursive: true })
-  await writeFile(recoveryPath, `${JSON.stringify({
-    schemaVersion: 1,
-    mode: 'dsh-browser-tools',
-    generation: 7,
-    updatedAt: 1,
-  }, null, 2)}\n`, 'utf8')
-  const recoveryStore = new BrowserControllerStore({
-    ctx,
-    storageRoot: recoveryRoot,
-    config: {
-      defaultMode: 'other',
-      conflictingToolPatterns: ['^browser_'],
-      includeTools: [],
-      excludeTools: [],
-    },
-    toolDefinitions: owned,
-    registerTools: (agent, definitions) => surface.register(agent, definitions),
-    suspendRuntime: async () => {},
-    releaseRuntime: async () => {},
-    isOwnedTool: name => owned.some(value => value.name === name),
-  })
-  const recoveryAgent = fakeAgent(recoverySessionId, surface)
-  recoveryStore.attach(recoveryAgent)
-  await recoveryAgent.preStep?.()
-  const restored = recoveryStore.snapshot(recoverySessionId)
-  assert(restored.status === 'active' && restored.generation === 7, '冷恢复没有沿用持久 active 状态与 generation')
-  assert(recoveryStore.identity(recoverySessionId)?.generation === 7, '冷恢复后的 Controller Identity generation 不正确')
-  assert((await recoveryStore.activate(recoverySessionId)).generation === 7, '重复激活错误递增了 generation')
-  assert(JSON.parse(await readFile(recoveryPath, 'utf8')).generation === 7, '冷恢复错误改写了持久 generation')
-  await recoveryStore.detach(recoveryAgent)
-  assert(recoveryAgent.preStep === undefined, 'Agent Dispose 后 pre-step 监听没有解除')
-  assert(surface.schemas(recoveryAgent).find(value => value.name === 'browser_snapshot')?.description === 'third-party-snapshot', 'Agent Dispose 后第三方同名工具没有恢复')
-  assert(surface.schemas(recoveryAgent).some(value => value.name === 'browser_auth'), 'Agent Dispose 后第三方独有工具没有恢复')
-  assert(recoveryStore.identity(recoverySessionId) === undefined, 'Agent Dispose 后 Controller Identity 仍然残留')
-
-  // DSH 可能在同一正式 Session 上用新 Agent Scope 替换旧 Scope。旧 Agent 的异步 detach
-  // 即使先进入并等待队列，也不得在新 Agent attach 后清除新 Scope 的工具、restriction 和 active 状态。
-  const replacementRoot = join(runtimeRoot, 'replacement')
-  const replacementSessionId = 'session-replaced-agent'
-  let releaseOldSuspend: (() => void) | undefined
-  let markOldSuspendEntered: (() => void) | undefined
-  const oldSuspend = new Promise<void>(resolve => { releaseOldSuspend = resolve })
-  const oldSuspendEntered = new Promise<void>(resolve => { markOldSuspendEntered = resolve })
-  const replacementStore = new BrowserControllerStore({
-    ctx,
-    storageRoot: replacementRoot,
-    config: {
-      defaultMode: 'other',
-      conflictingToolPatterns: ['^browser_'],
-      includeTools: [],
-      excludeTools: [],
-    },
-    toolDefinitions: owned,
-    registerTools: (agent, definitions) => surface.register(agent, definitions),
-    suspendRuntime: async () => {
-      markOldSuspendEntered?.()
-      await oldSuspend
-    },
-    releaseRuntime: async () => {},
-    isOwnedTool: name => owned.some(value => value.name === name),
-  })
-  const oldAgent = fakeAgent(replacementSessionId, surface)
-  replacementStore.attach(oldAgent)
-  await oldAgent.preStep?.()
-  await replacementStore.activate(replacementSessionId)
-  const queuedOldDeactivation = replacementStore.deactivate(replacementSessionId)
-  await oldSuspendEntered
-  const staleDetach = replacementStore.detach(oldAgent)
-  const newAgent = fakeAgent(replacementSessionId, surface)
-  replacementStore.attach(newAgent)
-  releaseOldSuspend?.()
-  await queuedOldDeactivation.then(
-    () => { throw new Error('旧 Agent 的排队退出在新 Scope 接管后错误成功') },
-    error => { assert(String(error).includes('Agent Scope 已更新'), '旧 Agent 过期退出没有返回明确竞态错误') },
+  await store.selectOther('session-browser-scope').then(
+    () => { throw new Error('已选择 BrowserScope 的 Session 错误允许改选其他工具') },
+    error => { assert(String(error).includes('新建 Session'), '改选拒绝没有给出新建 Session 指引') },
   )
-  await staleDetach
-  await newAgent.preStep?.()
-  const replaced = replacementStore.snapshot(replacementSessionId)
-  assert(replaced.status === 'active' && replaced.mode === 'dsh-browser-tools', '旧 Agent detach 清除了新 Agent 的 active Controller 状态')
-  assert(surface.schemas(newAgent).find(value => value.name === 'browser_snapshot')?.description === 'dsh-browser-tools-snapshot', '新 Agent 没有重建本插件 scoped 工具面')
-  assert(!surface.schemas(newAgent).some(value => value.name === 'browser_auth'), '新 Agent 没有恢复第三方独有工具 restriction')
-  await replacementStore.detach(newAgent)
 
-  // 损坏持久文件必须失败关闭到 other；即使 defaultMode 配置为本插件，也不能自动抢占第三方工具面。
+  // 释放资源只关闭 BrowserScope 自己的浏览器状态，不解除工具锁定，也不恢复第三方工具。
+  const releasedSnapshot = await store.release('session-browser-scope')
+  assert(releasedSnapshot.status === 'active' && releasedSnapshot.mode === 'dsh-browser-tools', '释放资源后错误解除 BrowserScope 锁定')
+  assert(releasedSnapshot.generation === 1, '释放资源不应改变浏览器选择代际')
+  assert(released.join(',') === 'session-browser-scope', '释放资源没有调用 Runtime 清理')
+  assert(surface.schemas(browserScopeAgent).find(value => value.name === 'browser_snapshot')?.description === 'dsh-browser-tools-snapshot', '释放资源后本插件工具没有保留')
+  assert(!surface.schemas(browserScopeAgent).some(value => value.name === 'browser_auth'), '释放资源后错误恢复第三方浏览器工具')
+
+  // 选择其他浏览器工具后永久锁定：撤销选择门，第三方工具恢复，BrowserScope 永久保持退出。
+  const selectedOther = await store.selectOther('session-other')
+  assert(selectedOther.mode === 'other' && selectedOther.selectionLocked === true, '选择其他浏览器工具后没有永久锁定')
+  assert(selectedOther.generation === 1, '选择其他浏览器工具没有递增代际')
+  assert(surface.schemas(otherAgent).find(value => value.name === 'browser_snapshot')?.description === 'third-party-snapshot', '选择其他工具后第三方同名工具没有恢复')
+  assert(surface.schemas(otherAgent).some(value => value.name === 'browser_auth'), '选择其他工具后第三方独有工具没有恢复')
+  await store.activate('session-other').then(
+    () => { throw new Error('已选择其他工具的 Session 错误允许启用 BrowserScope') },
+    error => { assert(String(error).includes('新建 Session'), 'BrowserScope 改选拒绝没有给出新建 Session 指引') },
+  )
+
+  const persistedFiles = await readdir(runtimeRoot)
+  assert(persistedFiles.filter(name => name.endsWith('.json')).length === 2, '两个已选择 Session 应各有一份持久记录')
+  const browserScopePath = join(runtimeRoot, `${createHash('sha256').update('session-browser-scope').digest('hex')}.json`)
+  const otherPath = join(runtimeRoot, `${createHash('sha256').update('session-other').digest('hex')}.json`)
+  const persistedBrowserScope = JSON.parse(await readFile(browserScopePath, 'utf8')) as { schemaVersion?: number; mode?: string; generation?: number }
+  const persistedOther = JSON.parse(await readFile(otherPath, 'utf8')) as { schemaVersion?: number; mode?: string; generation?: number }
+  assert(persistedBrowserScope.schemaVersion === 2 && persistedBrowserScope.mode === 'dsh-browser-tools' && persistedBrowserScope.generation === 1, 'BrowserScope 锁定记录不正确')
+  assert(persistedOther.schemaVersion === 2 && persistedOther.mode === 'other' && persistedOther.generation === 1, '其他浏览器工具锁定记录不正确')
+
+  // DSH 重启或 Agent Scope 替换后继续恢复原选择，不允许重新选择。
+  await store.detach(browserScopeAgent)
+  const restoredBrowserScopeAgent = fakeAgent('session-browser-scope', surface)
+  store.attach(restoredBrowserScopeAgent)
+  await restoredBrowserScopeAgent.preStep?.()
+  const restoredBrowserScope = store.snapshot('session-browser-scope')
+  assert(restoredBrowserScope.mode === 'dsh-browser-tools' && restoredBrowserScope.status === 'active', '重启后没有恢复 BrowserScope 锁定')
+  assert(restoredBrowserScope.generation === 1, '重启恢复不应改变选择代际')
+
+  await store.detach(otherAgent)
+  const restoredOtherAgent = fakeAgent('session-other', surface)
+  store.attach(restoredOtherAgent)
+  await restoredOtherAgent.preStep?.()
+  const restoredOther = store.snapshot('session-other')
+  assert(restoredOther.mode === 'other' && restoredOther.selectionLocked === true, '重启后没有恢复其他工具锁定')
+  assert(surface.schemas(restoredOtherAgent).some(value => value.name === 'browser_auth'), '重启后第三方浏览器工具没有恢复')
+
+  // 旧版 other 只代表当时未启用 BrowserScope，迁移时必须回到尚未选择，避免误锁死。
+  const legacyOtherRoot = join(runtimeRoot, 'legacy-other')
+  const legacyOtherSession = 'legacy-other-session'
+  const legacyOtherPath = join(legacyOtherRoot, `${createHash('sha256').update(legacyOtherSession).digest('hex')}.json`)
+  await mkdir(legacyOtherRoot, { recursive: true })
+  await writeFile(legacyOtherPath, `${JSON.stringify({ schemaVersion: 1, mode: 'other', generation: 7, updatedAt: 1 }, null, 2)}\n`, 'utf8')
+  const legacyOtherStore = createStore(legacyOtherRoot, surface, owned)
+  const legacyOtherAgent = fakeAgent(legacyOtherSession, surface)
+  legacyOtherStore.attach(legacyOtherAgent)
+  await legacyOtherAgent.preStep?.()
+  const migratedOther = legacyOtherStore.snapshot(legacyOtherSession)
+  assert(migratedOther.mode === 'unselected' && migratedOther.selectionLocked === false, '旧 other 状态没有迁移为尚未选择')
+  assert(!surface.schemas(legacyOtherAgent).some(value => value.name.startsWith('browser_')), '旧 other 迁移后没有应用选择门')
+  const migratedOtherRecord = JSON.parse(await readFile(legacyOtherPath, 'utf8')) as { schemaVersion?: number; mode?: string; generation?: number }
+  assert(migratedOtherRecord.schemaVersion === 2 && migratedOtherRecord.mode === 'unselected' && migratedOtherRecord.generation === 7, '旧 other 迁移结果没有写回 schema v2')
+
+  // 旧版 BrowserScope 激活状态继续恢复为 BrowserScope 锁定。
+  const legacyBrowserScopeRoot = join(runtimeRoot, 'legacy-browser-scope')
+  const legacyBrowserScopeSession = 'legacy-browser-scope-session'
+  const legacyBrowserScopePath = join(legacyBrowserScopeRoot, `${createHash('sha256').update(legacyBrowserScopeSession).digest('hex')}.json`)
+  await mkdir(legacyBrowserScopeRoot, { recursive: true })
+  await writeFile(legacyBrowserScopePath, `${JSON.stringify({ schemaVersion: 1, mode: 'dsh-browser-tools', generation: 9, updatedAt: 1 }, null, 2)}\n`, 'utf8')
+  const legacyBrowserScopeStore = createStore(legacyBrowserScopeRoot, surface, owned)
+  const legacyBrowserScopeAgent = fakeAgent(legacyBrowserScopeSession, surface)
+  legacyBrowserScopeStore.attach(legacyBrowserScopeAgent)
+  await legacyBrowserScopeAgent.preStep?.()
+  const migratedBrowserScope = legacyBrowserScopeStore.snapshot(legacyBrowserScopeSession)
+  assert(migratedBrowserScope.mode === 'dsh-browser-tools' && migratedBrowserScope.status === 'active', '旧 BrowserScope 状态没有继续锁定')
+  assert(migratedBrowserScope.generation === 9, '旧 BrowserScope 状态迁移错误改变代际')
+  const migratedBrowserScopeRecord = JSON.parse(await readFile(legacyBrowserScopePath, 'utf8')) as { schemaVersion?: number; mode?: string; generation?: number }
+  assert(migratedBrowserScopeRecord.schemaVersion === 2 && migratedBrowserScopeRecord.mode === 'dsh-browser-tools' && migratedBrowserScopeRecord.generation === 9, '旧 BrowserScope 迁移结果没有写回 schema v2')
+
+  // 首次选择的持久化失败必须完整回滚，不能消耗 generation 或暴露浏览器工具。
+  const failedSelectionRoot = join(runtimeRoot, 'selection-persist-blocked')
+  await writeFile(failedSelectionRoot, 'not-a-directory', 'utf8')
+  const failedSelectionStore = createStore(failedSelectionRoot, surface, owned)
+  const failedSelectionSession = 'selection-persist-failed-session'
+  const failedSelectionAgent = fakeAgent(failedSelectionSession, surface)
+  failedSelectionStore.attach(failedSelectionAgent)
+  await failedSelectionAgent.preStep?.()
+  await failedSelectionStore.activate(failedSelectionSession).then(
+    () => { throw new Error('持久化失败时错误完成了 BrowserScope 选择') },
+    () => undefined,
+  )
+  const failedSelection = failedSelectionStore.snapshot(failedSelectionSession)
+  assert(failedSelection.mode === 'unselected' && failedSelection.status === 'error', '持久化失败后没有回到尚未选择')
+  assert(failedSelection.generation === 0 && failedSelection.selectionLocked === false, '持久化失败错误消耗了选择代际')
+  assert(!surface.schemas(failedSelectionAgent).some(value => value.name.startsWith('browser_')), '持久化失败后浏览器工具被错误暴露')
+
+  const failedOtherRoot = join(runtimeRoot, 'other-persist-blocked')
+  await writeFile(failedOtherRoot, 'not-a-directory', 'utf8')
+  const failedOtherStore = createStore(failedOtherRoot, surface, owned)
+  const failedOtherSession = 'other-persist-failed-session'
+  const failedOtherAgent = fakeAgent(failedOtherSession, surface)
+  failedOtherStore.attach(failedOtherAgent)
+  await failedOtherAgent.preStep?.()
+  await failedOtherStore.selectOther(failedOtherSession).then(
+    () => { throw new Error('持久化失败时错误完成了其他浏览器工具选择') },
+    () => undefined,
+  )
+  const failedOther = failedOtherStore.snapshot(failedOtherSession)
+  assert(failedOther.mode === 'unselected' && failedOther.status === 'error', '其他工具持久化失败后没有回到尚未选择')
+  assert(failedOther.generation === 0 && failedOther.selectionLocked === false, '其他工具持久化失败错误消耗了选择代际')
+  assert(!surface.schemas(failedOtherAgent).some(value => value.name.startsWith('browser_')), '其他工具持久化失败后浏览器工具被错误暴露')
+
+  // 已持久锁定 BrowserScope 的 Session 即使恢复工具面失败，也不能降级成可改选状态。
+  const failedRestoreRoot = join(runtimeRoot, 'restore-failed')
+  const failedRestoreSession = 'restore-failed-session'
+  const failedRestorePath = join(failedRestoreRoot, `${createHash('sha256').update(failedRestoreSession).digest('hex')}.json`)
+  await mkdir(failedRestoreRoot, { recursive: true })
+  await writeFile(failedRestorePath, `${JSON.stringify({ schemaVersion: 2, mode: 'dsh-browser-tools', generation: 11, updatedAt: 1 }, null, 2)}\n`, 'utf8')
+  const failedRestoreStore = createStore(
+    failedRestoreRoot,
+    surface,
+    owned,
+    [],
+    () => { throw new Error('owned-tool-registration-failed') },
+  )
+  const failedRestoreAgent = fakeAgent(failedRestoreSession, surface)
+  failedRestoreStore.attach(failedRestoreAgent)
+  await failedRestoreAgent.preStep?.()
+  const failedRestore = failedRestoreStore.snapshot(failedRestoreSession)
+  assert(failedRestore.mode === 'dsh-browser-tools' && failedRestore.status === 'error', 'BrowserScope 恢复失败后错误解除持久锁定')
+  assert(failedRestore.selectionLocked === true && failedRestore.generation === 11, 'BrowserScope 恢复失败后锁定身份不正确')
+  assert(!surface.schemas(failedRestoreAgent).some(value => value.name.startsWith('browser_')), 'BrowserScope 恢复失败后暴露了第三方浏览器工具')
+  surface.globals.set('browser_late_provider', definition('browser_late_provider', 'late-third-party'))
+  await failedRestoreAgent.preStep?.()
+  assert(!surface.schemas(failedRestoreAgent).some(value => value.name === 'browser_late_provider'), '恢复失败状态没有阻止后加载的第三方浏览器工具')
+
+  // 损坏记录保持尚未选择，不能自动启用任何浏览器工具。
   const corruptRoot = join(runtimeRoot, 'corrupt')
-  const corruptSessionId = 'session-corrupt'
-  const corruptPath = join(corruptRoot, `${createHash('sha256').update(corruptSessionId).digest('hex')}.json`)
+  const corruptSession = 'corrupt-session'
+  const corruptPath = join(corruptRoot, `${createHash('sha256').update(corruptSession).digest('hex')}.json`)
   await mkdir(corruptRoot, { recursive: true })
   await writeFile(corruptPath, '{broken', 'utf8')
-  const corruptStore = new BrowserControllerStore({
-    ctx,
-    storageRoot: corruptRoot,
-    config: {
-      defaultMode: 'dsh-browser-tools',
-      conflictingToolPatterns: ['^browser_'],
-      includeTools: [],
-      excludeTools: [],
-    },
-    toolDefinitions: owned,
-    registerTools: (agent, definitions) => surface.register(agent, definitions),
-    suspendRuntime: async () => {},
-    releaseRuntime: async () => {},
-    isOwnedTool: name => owned.some(value => value.name === name),
-  })
-  const corruptAgent = fakeAgent(corruptSessionId, surface)
+  const corruptStore = createStore(corruptRoot, surface, owned)
+  const corruptAgent = fakeAgent(corruptSession, surface)
   corruptStore.attach(corruptAgent)
   await corruptAgent.preStep?.()
-  const corrupt = corruptStore.snapshot(corruptSessionId)
-  assert(corrupt.mode === 'other' && corrupt.status === 'inactive', '损坏持久状态没有安全回退到 other')
-  assert(corrupt.error?.includes('持久状态损坏或不可读') === true, '损坏持久状态没有暴露可诊断错误')
-  assert(surface.schemas(corruptAgent).find(value => value.name === 'browser_snapshot')?.description === 'third-party-snapshot', '损坏持久状态错误抢占了第三方同名工具')
-  assert(await readFile(corruptPath, 'utf8') === '{broken', '损坏持久文件被自动覆盖')
-  await corruptStore.detach(corruptAgent)
-  assert(corruptAgent.preStep === undefined, '损坏状态 Session detach 后监听没有解除')
-
-  // 激活失败必须撤销已经注册的本插件工具，并保持第三方工具面原样。
-  const failingStore = new BrowserControllerStore({
-    ctx,
-    storageRoot: join(runtimeRoot, 'failing'),
-    config: {
-      defaultMode: 'other',
-      conflictingToolPatterns: ['^browser_'],
-      includeTools: [],
-      excludeTools: [],
-    },
-    toolDefinitions: owned,
-    registerTools: (agent, definitions) => {
-      const dispose = surface.register(agent, definitions)
-      dispose()
-      throw new Error('registration-failed')
-    },
-    suspendRuntime: async () => {},
-    releaseRuntime: async () => {},
-    isOwnedTool: name => owned.some(value => value.name === name),
-  })
-  const failingAgent = fakeAgent('session-failing', surface)
-  failingStore.attach(failingAgent)
-  await failingAgent.preStep?.()
-  await failingStore.activate('session-failing').then(
-    () => { throw new Error('激活失败测试没有抛出错误') },
-    () => {},
-  )
-  assert(failingStore.snapshot('session-failing').mode === 'other', '激活失败后模式没有回滚到 other')
-  assert(surface.schemas(failingAgent).find(value => value.name === 'browser_snapshot')?.description === 'third-party-snapshot', '激活失败后第三方工具面未恢复')
-
-  // 安全退出失败时必须保持 active 和 scoped 工具，允许用户继续解除阻断。
-  const unsafeStore = new BrowserControllerStore({
-    ctx,
-    storageRoot: join(runtimeRoot, 'unsafe'),
-    config: {
-      defaultMode: 'other',
-      conflictingToolPatterns: ['^browser_'],
-      includeTools: [],
-      excludeTools: [],
-    },
-    toolDefinitions: owned,
-    registerTools: (agent, definitions) => surface.register(agent, definitions),
-    suspendRuntime: async () => { throw new Error('debugger-resume-failed') },
-    releaseRuntime: async () => {},
-    isOwnedTool: name => owned.some(value => value.name === name),
-  })
-  const unsafeAgent = fakeAgent('session-unsafe', surface)
-  unsafeStore.attach(unsafeAgent)
-  await unsafeAgent.preStep?.()
-  await unsafeStore.activate('session-unsafe')
-  await unsafeStore.deactivate('session-unsafe').then(
-    () => { throw new Error('安全退出失败测试没有抛出错误') },
-    () => {},
-  )
-  const unsafe = unsafeStore.snapshot('session-unsafe')
-  assert(unsafe.status === 'active' && unsafe.mode === 'dsh-browser-tools', '安全退出失败后没有保持 active')
-  assert(surface.schemas(unsafeAgent).find(value => value.name === 'browser_snapshot')?.description === 'dsh-browser-tools-snapshot', '安全退出失败后本插件工具被错误注销')
-
-  // 插件卸载/HMR 必须无条件撤销 scoped 副作用和监听，即使控制器此前因安全退出失败仍保持 active。
-  await unsafeStore.dispose()
-  assert(unsafeAgent.preStep === undefined, 'Store Dispose 后 pre-step 监听没有解除')
-  assert(surface.schemas(unsafeAgent).find(value => value.name === 'browser_snapshot')?.description === 'third-party-snapshot', 'Store Dispose 后第三方同名工具没有恢复')
-  assert(surface.schemas(unsafeAgent).some(value => value.name === 'browser_auth'), 'Store Dispose 后第三方独有工具没有恢复')
-  assert((surface.guards.get(unsafeAgent)?.size ?? 0) === 0, 'Store Dispose 后 guard 仍然残留')
-  assert(unsafeStore.identity('session-unsafe') === undefined, 'Store Dispose 后 Controller Identity 仍然残留')
+  const corrupt = corruptStore.snapshot(corruptSession)
+  assert(corrupt.mode === 'unselected' && corrupt.selectionLocked === false, '损坏记录没有保持尚未选择')
+  assert(corrupt.error?.includes('需要重新选择') === true, '损坏记录没有给出重新选择提示')
 
   await store.dispose()
-  await failingStore.dispose()
+  await legacyOtherStore.dispose()
+  await legacyBrowserScopeStore.dispose()
+  await failedSelectionStore.dispose()
+  await failedOtherStore.dispose()
+  await failedRestoreStore.dispose()
+  await corruptStore.dispose()
 
   process.stdout.write(`${JSON.stringify({
     ok: true,
-    shadowed: active.shadowedTools,
-    restricted: active.restrictedTools,
-    secondSessionUnaffected: true,
-    suspendPreservedPages: suspended.length === 1,
-    releaseCalled: released.length === 1,
-    activationRollback: true,
-    deactivationFailureRetainedOwnership: true,
-    coldRestorePreservedGeneration: restored.generation === 7,
-    corruptStateFailedClosed: corrupt.mode === 'other',
-    agentReplacementSafe: replaced.status === 'active',
-    agentDisposeClean: recoveryAgent.preStep === undefined,
-    hmrDisposeClean: unsafeAgent.preStep === undefined,
-    persistedGeneration: persisted.generation,
+    unselectedToolsHidden: true,
+    browserScopeLocked: true,
+    otherToolsLocked: true,
+    releasePreservedSelection: true,
+    restartPreservedSelection: true,
+    legacyOtherMigratedToUnselected: true,
+    legacyBrowserScopePreserved: true,
+    migrationPersistedAsSchemaV2: true,
+    failedSelectionRolledBack: true,
+    failedOtherSelectionRolledBack: true,
+    failedRestorePreservedLock: true,
+    corruptStateRequiresSelection: true,
   }, null, 2)}\n`)
 } finally {
   await rm(runtimeRoot, { recursive: true, force: true })
   const runtimeParent = join(process.cwd(), '.runtime')
-  // Controller 专项只负责自己的运行目录；父目录确认为空时一并删除，避免公开卫生误判，同时不影响其他并行测试。
   const remaining = await readdir(runtimeParent).catch(() => undefined)
   if (remaining?.length === 0) await rmdir(runtimeParent)
 }

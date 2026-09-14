@@ -328,11 +328,17 @@ async function boundedResponseBody(response: Response): Promise<Buffer> {
   return Buffer.concat(chunks, bytes)
 }
 
-async function downloadWithChromium(sourceUrl: string, executablePath: string): Promise<Buffer> {
+interface ChromiumDownloadNetwork {
+  args?: string[]
+  proxy?: { server: string; bypass?: string; username?: string; password?: string }
+}
+
+async function downloadWithChromium(sourceUrl: string, executablePath: string, network: ChromiumDownloadNetwork = {}): Promise<Buffer> {
   const browser = await chromium.launch({
     executablePath,
     headless: true,
-    args: ['--disable-background-networking', '--disable-component-update', '--disable-sync', '--no-first-run'],
+    ...(network.proxy === undefined ? {} : { proxy: network.proxy }),
+    args: network.args ?? [],
   })
   try {
     const context = await browser.newContext()
@@ -374,7 +380,7 @@ async function downloadWithChromium(sourceUrl: string, executablePath: string): 
   }
 }
 
-export async function downloadChromeWebStoreExtension(input: string, target: string, chromiumExecutablePath?: string): Promise<{ extensionId: string; name: string; version: string; sourceUrl: string; actionPopup?: string }> {
+export async function downloadChromeWebStoreExtension(input: string, target: string, chromiumExecutablePath?: string, chromiumNetwork?: ChromiumDownloadNetwork): Promise<{ extensionId: string; name: string; version: string; sourceUrl: string; actionPopup?: string }> {
   const extensionId = chromeWebStoreExtensionId(input)
   const query = `response=redirect&prodversion=149.0.7827.55&acceptformat=crx3&x=${encodeURIComponent(`id=${extensionId}&installsource=ondemand&uc`)}`
   const sources = [
@@ -397,7 +403,7 @@ export async function downloadChromeWebStoreExtension(input: string, target: str
   if (chromiumExecutablePath !== undefined) {
     for (const sourceUrl of sources) {
       try {
-        return await installChromeWebStorePackage(await downloadWithChromium(sourceUrl, chromiumExecutablePath), extensionId, target, sourceUrl)
+        return await installChromeWebStorePackage(await downloadWithChromium(sourceUrl, chromiumExecutablePath, chromiumNetwork), extensionId, target, sourceUrl)
       } catch (error) {
         lastError = error
       }

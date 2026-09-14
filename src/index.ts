@@ -7,9 +7,10 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ParameterSchemaSpec, ToolDefinition, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-attachment'
+import type {} from '@deepseek-ai/dsh-permission-presets'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { BrowserError } from './errors.ts'
-import { registerLoopbackRpc } from './dsh-compat.ts'
+import { registerAuthenticatedRpc } from './dsh-compat.ts'
 import { resolveConfig } from './policy.ts'
 import { BrowserControllerStore } from './browser-controller.ts'
 import type { BrowserControllerSnapshot } from './browser-controller.ts'
@@ -18,7 +19,7 @@ import type { Config as BrowserConfig, Identity, ToolOutput } from './types.ts'
 import type { BrowserDebuggerAction, BrowserDebuggerInput, BrowserDiagnoseAction, BrowserDiagnoseInput, BrowserEmulateAction, BrowserEmulateInput, BrowserEvaluateAction, BrowserEvaluateInput, BrowserExtensionAction, BrowserExtensionInput, BrowserInputTraceUpdate, BrowserLiveViewAction, BrowserLiveViewInput, BrowserNetworkAction, BrowserNetworkInput, BrowserPanelTabAction, BrowserPanelTabInput, BrowserPanelView, BrowserProfileAction, BrowserProfileInput, BrowserProviderAction, BrowserProviderInput, BrowserRecorderAction, BrowserRecorderInput, BrowserSplitViewAction, BrowserSplitViewInput, BrowserTakeoverAction, BrowserTakeoverInput, BrowserUserInput } from './protocol.ts'
 
 export const name = 'dsh-browser-scope'
-export const inject = ['tools', 'attachments', 'agents', 'sessions']
+export const inject = ['tools', 'attachments', 'agents', 'sessions', 'permissionPresets']
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -29,6 +30,13 @@ declare module '@deepseek-ai/cordis' {
 export const Config: z<BrowserConfig> = z.object({
   executablePath: z.string(),
   headless: z.boolean().default(true),
+  proxy: z.object({
+    mode: z.union(['system', 'direct', 'custom']).default('system'),
+    server: z.string(),
+    bypass: z.string(),
+    username: z.string(),
+    password: z.string(),
+  }).default({ mode: 'system', server: '', bypass: '', username: '', password: '' }),
   allowedOrigins: z.array(z.string()).default([]),
   allowLoopback: z.boolean().default(true),
   allowPrivateNetwork: z.boolean().default(true),
@@ -44,14 +52,12 @@ export const Config: z<BrowserConfig> = z.object({
   chromiumDownloadTimeoutMs: z.number().step(1).min(1000).default(300000),
   subagentInteractive: z.boolean().default(false),
   sharedProfileSeedSessionId: z.string(),
-  toolRegistrationMode: z.union(['global', 'session-select']).default('global'),
+  toolRegistrationMode: z.union(['global', 'session-select']).default('session-select'),
   sessionController: z.object({
-    defaultMode: z.union(['other', 'dsh-browser-tools']).default('other'),
     conflictingToolPatterns: z.array(z.string()).default(['^browser_', '^chrome_', '^pilot_', '^mcp__playwright__', '^mcp__chrome_devtools__']),
     excludeTools: z.array(z.string()).default([]),
     includeTools: z.array(z.string()).default([]),
   }).default({
-    defaultMode: 'other',
     conflictingToolPatterns: ['^browser_', '^chrome_', '^pilot_', '^mcp__playwright__', '^mcp__chrome_devtools__'],
     excludeTools: [],
     includeTools: [],
@@ -98,7 +104,7 @@ const providerActions: BrowserProviderAction[] = ['list', 'connect', 'disconnect
 const extensionActions: BrowserExtensionAction[] = ['list', 'install', 'enable', 'disable', 'uninstall', 'apply', 'open_popup', 'close_popup']
 const takeoverActions: BrowserTakeoverAction[] = ['status', 'request', 'return', 'cancel']
 const liveViewActions: BrowserLiveViewAction[] = ['status', 'standard', 'adaptive', 'initialize', 'resize']
-const splitViewActions: BrowserSplitViewAction[] = ['status', 'open', 'close', 'swap', 'assign', 'focus', 'ratio', 'resize']
+const splitViewActions: BrowserSplitViewAction[] = ['status', 'open', 'close', 'swap', 'assign', 'focus', 'ratio', 'orientation', 'resize']
 const panelTabActions: BrowserPanelTabAction[] = ['new', 'select', 'close', 'back', 'forward', 'reload', 'navigate']
 const panelViews: BrowserPanelView[] = ['live', 'diagnostic', 'console', 'network', 'debugger', 'performance', 'provider', 'extensions', 'emulation']
 
@@ -158,18 +164,23 @@ export function apply(ctx: Context, config: BrowserConfig): void {
   const resolved = resolveConfig(config)
   const runtime = new BrowserRuntime(resolved, ctx.attachments)
   const definitions: ToolDefinition[] = []
+  // 实际注册模式允许在发现现有浏览器工具后从 global 安全降级；RPC、审批与执行归属必须统一读取该值，禁止配置值与运行时行为分叉。
+  let effectiveToolRegistrationMode = resolved.toolRegistrationMode
   // 每个插件实例按自身 Context 收集同一套工具 Definition；global 与 session-select
   // 只决定后续注册位置，不允许在定义阶段产生工具面副作用。
   definitionCollectors.set(ctx, definitions)
   let controller: BrowserControllerStore | undefined
+  // RC.1 的自定义 rpc.handle() 在第三方插件上下文中无法完成内部 webServer 注入。
+  // 这里改用 Connection 已挂载且统一认证的 /api Carrier 精确路由：局部 Fiber 只需等待
+  // connection 服务，并返回异步 disposer，使路由随插件连接能力一起加载和卸载。
   ctx.inject(['connection'], (connectionCtx) => {
-    registerLoopbackRpc(connectionCtx.connection, '/browser-tools', async (endpoint, payload) => {
+    return registerAuthenticatedRpc(connectionCtx.connection, '/api/browser-tools', 'browser-tools', async (endpoint, payload) => {
       try {
         if (!isRecord(payload) || typeof payload.sessionId !== 'string' || payload.sessionId.trim() === '') return rpcFailure('browser panel requires a non-empty sessionId')
         const sessionId = payload.sessionId
         if (endpoint === 'controller_status') {
           await controller?.waitUntilReady(sessionId)
-          const value: BrowserControllerSnapshot & { registrationMode: 'global' | 'session-select' } = resolved.toolRegistrationMode === 'global'
+          const value: BrowserControllerSnapshot & { registrationMode: 'global' | 'session-select' } = effectiveToolRegistrationMode === 'global'
             ? {
                 registrationMode: 'global',
                 mode: 'dsh-browser-tools',
@@ -178,36 +189,40 @@ export function apply(ctx: Context, config: BrowserConfig): void {
                 conflictingTools: [],
                 shadowedTools: [],
                 restrictedTools: [],
+                selectionLocked: true,
                 canSwitchNow: false,
                 blockers: ['global-registration-mode'],
               }
             : {
                 registrationMode: 'session-select',
                 ...(controller?.snapshot(sessionId) ?? {
-                  mode: 'other',
+                  mode: 'unselected',
                   status: 'inactive',
                   generation: 0,
                   conflictingTools: [],
                   shadowedTools: [],
                   restrictedTools: [],
+                  selectionLocked: false,
                   canSwitchNow: false,
                   blockers: ['controller-not-ready'],
                 }),
               }
           return rpcSuccess(value)
         }
-        if (endpoint === 'controller_activate' || endpoint === 'controller_deactivate' || endpoint === 'controller_release') {
-          if (resolved.toolRegistrationMode !== 'session-select' || controller === undefined) return rpcFailure('Session controller selection requires toolRegistrationMode=session-select')
+        if (endpoint === 'controller_activate' || endpoint === 'controller_select_other' || endpoint === 'controller_release') {
+          if (effectiveToolRegistrationMode !== 'session-select' || controller === undefined) return rpcFailure('Session browser selection requires session-select registration')
           const agent = ctx.agents.get(SessionId(sessionId))
-          if (agent === undefined) return rpcFailure('browser controller requires a live DSH agent session')
-          if (agent.session.header.origin === 'subagent') return rpcFailure('delegated sessions cannot switch browser controllers')
+          if (agent === undefined) return rpcFailure('browser selection requires a live DSH agent session')
+          if (agent.session.header.origin === 'subagent') return rpcFailure('delegated sessions cannot select browser tools')
           const result = endpoint === 'controller_activate'
             ? await controller.activate(sessionId)
-            : await controller.deactivate(sessionId, endpoint === 'controller_release')
+            : endpoint === 'controller_select_other'
+              ? await controller.selectOther(sessionId)
+              : await controller.release(sessionId)
           return rpcSuccess({ registrationMode: 'session-select', ...result })
         }
         await controller?.waitUntilReady(sessionId)
-        if (resolved.toolRegistrationMode === 'session-select' && controller?.isActive(sessionId) !== true) {
+        if (effectiveToolRegistrationMode === 'session-select' && controller?.isActive(sessionId) !== true) {
           // 未选择本插件时只保留轻量 Controller RPC；禁止面板 Snapshot、标签、输入和调试接口
           // 隐式创建 BrowserContext，从而保证 other 模式不消耗浏览器资源也不改变第三方状态。
           return rpcFailure('当前 Session 尚未启用 DSH BrowserScope')
@@ -303,9 +318,10 @@ export function apply(ctx: Context, config: BrowserConfig): void {
           const result = await runtime.panelSplitView(sessionId, payload as unknown as BrowserSplitViewInput)
           if (agent !== undefined && ctx.agents.get(SessionId(sessionId)) === agent && result.ok && isRecord(result.data) && result.data.changed === true) {
             try {
+              const orientationLabel = result.data.orientation === 'left-right' ? '左右' : '上下'
               agent.inject(createUserMessage({
-                content: [{ type: 'text', text: `用户已调整右侧浏览器上下双页分屏。当前状态：${result.data.enabled === true ? `已开启，上方占比 ${Math.round(Number(result.data.ratio) * 100)}%` : '已关闭'}；当前焦点标签 viewId=${result.viewId ?? 'none'}。后续未显式提供 viewId 的浏览器工具将操作当前焦点标签。` }],
-                source: { kind: 'plugin', plugin: name, form: 'notice', summary: '用户调整浏览器上下分屏' },
+                content: [{ type: 'text', text: `用户已调整右侧浏览器${orientationLabel}双页分屏。当前状态：${result.data.enabled === true ? `已开启，第一窗格占比 ${Math.round(Number(result.data.ratio) * 100)}%` : '已关闭'}；当前焦点标签 viewId=${result.viewId ?? 'none'}。后续未显式提供 viewId 的浏览器工具将操作当前焦点标签。` }],
+                source: { kind: 'plugin', plugin: name, form: 'notice', summary: `用户调整浏览器${orientationLabel}分屏` },
               }))
             } catch {}
           }
@@ -397,7 +413,7 @@ export function apply(ctx: Context, config: BrowserConfig): void {
   ctx.on('tools/pre-execute', async (exec, next) => {
     const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
     const owned = definitions.some(definition => definition.name === exec.name)
-      && (resolved.toolRegistrationMode === 'global' || controller?.ownsExecution(sessionId, exec.name) === true)
+      && (effectiveToolRegistrationMode === 'global' || controller?.ownsExecution(sessionId, exec.name) === true)
     // 第三方工具即使使用 browser_* 前缀，也不属于本插件的 Approval 与 Subagent 策略。
     if (!owned) return next()
     const child = exec.agent?.session.header.origin === 'subagent'
@@ -418,9 +434,8 @@ export function apply(ctx: Context, config: BrowserConfig): void {
     const v2Sensitive = debuggerSensitiveRead || diagnoseSensitiveRead || recorderMutation || networkSensitive || profileSensitive || providerMutation || extensionMutation || emulateMutation || evaluateSensitive || takeoverMutation
     // 空白页签不访问外部地址，继续免审批；携带非空 URL 的 new 与 browser_navigate 具有相同导航副作用。
     const tabNavigation = exec.name === 'browser_tabs' && isRecord(exec.arguments) && exec.arguments.action === 'new' && typeof exec.arguments.url === 'string' && exec.arguments.url.trim() !== '' && exec.arguments.url.trim() !== 'about:blank'
-    // DSH 的公开 SessionEvent 联合暂未声明权限预设事件，但运行时会持久化该事件；这里仅建立局部只读视图，不修改原 Session 数据。
-    const sessionEvents = (exec.agent?.session.events ?? []) as unknown as ReadonlyArray<{ type: string; data: Record<string, unknown> }>
-    const permissionPreset = [...sessionEvents].reverse().find(event => event.type === 'permission/preset')?.data.preset
+    const session = exec.agent?.session
+    const permissionPreset = session === undefined ? undefined : ctx.permissionPresets.current(session)
     if (child && !resolved.subagentInteractive && (exec.name === 'browser_diagnose' || debuggerMutation || liveViewMutation || splitViewMutation || v2Sensitive || /^(browser_click|browser_type|browser_press_key|browser_select_option|browser_upload_file|browser_download)$/.test(exec.name))) {
       return { kind: 'deny', reason: `delegated browser session cannot use ${exec.name}` }
     }
@@ -577,7 +592,7 @@ export function apply(ctx: Context, config: BrowserConfig): void {
   })
   tool(ctx, {
     name: 'browser_diagnose',
-    description: 'Create a bounded frontend debugging evidence chain for the selected tab. start binds one view and enables L3 context identity collection. recorder_start explicitly enables privacy-preserving Rolling or Deep recording; the default remains Off. recorder_status/timeline are read-only, while pause/resume/clear/stop/mark/complete change recorder state. Rolling keeps up to 180 seconds of redacted interaction metadata without a persistent Live View recording banner; Deep is explicit and visibly marked in the panel. Input text, passwords, verification codes, cookies, authorization, clipboard contents, and file contents are never stored in recorder events. Fixing the primary root cause is not completion: before reporting success, verify cancellation and stale async work, controlled handling of business non-2xx responses, zero remaining page runtime errors, and a successful comparable checkpoint comparison without new critical regressions. Expected AbortError must not remain as a page error, and a failed or unavailable Compare must not be replaced by a manual success claim. inspect, checkpoint, compare, report, and stop retain their existing semantics. It never modifies Workspace files, reads Network bodies, bypasses cross-origin restrictions, or executes model-supplied JavaScript.',
+    description: 'Create a bounded frontend debugging evidence chain for the selected tab. start binds one view and enables L3 context identity collection. recorder_start explicitly enables privacy-preserving Rolling or Deep recording; the default remains Off. recorder_status/timeline are read-only, while pause/resume/clear/stop/mark/complete change recorder state. Rolling keeps up to 180 seconds of redacted interaction metadata without a persistent Live View recording banner; Deep is explicit and visibly marked in the panel. Input text, passwords, verification codes, cookies, authorization, clipboard contents, and file contents are never stored in recorder events. Fixing the primary root cause is not completion: before reporting success, verify cancellation and stale async work, controlled handling of business non-2xx responses, zero remaining page runtime errors, and a successful comparable checkpoint comparison without new critical regressions. Expected AbortError must not remain as a page error, and a failed or unavailable Compare must not be replaced by a manual success claim. When acceptance logic combines scope, identity, and ordering fields (revision/version/generation/epoch/sequence), do not infer monotonicity from same-identity tests alone. Before claiming closure, cover identity unchanged/changed × order equal/higher/lower × owner/context current/stale. Keep unspecified combinations unverified; evidence claims must not exceed the demonstrated relations. inspect, checkpoint, compare, report, and stop retain their existing semantics. It never modifies Workspace files, reads Network bodies, bypasses cross-origin restrictions, or executes model-supplied JavaScript.',
     parameters: {
       action: { type: 'string', enum: diagnoseActions, required: true },
       viewId: { type: 'string' },
@@ -671,10 +686,11 @@ export function apply(ctx: Context, config: BrowserConfig): void {
   })
   tool(ctx, {
     name: 'browser_split_view',
-    description: 'Read or control the current DSH Session browser internal top/bottom split view without approval. The human UI keeps these controls inside a collapsed floating panel; agents must call browser_split_view directly and must not search for or click that UI. open creates a bottom about:blank tab when only one tab exists. close keeps the focused tab. swap exchanges panes, assign places a viewId in one pane, focus changes the default tool target, and ratio clamps the top pane to 40%-60%. Tell the user after changing the layout.',
+    description: 'Read or control the current DSH Session browser internal two-page split view without approval. The human UI keeps these controls inside a collapsed floating panel; agents must call browser_split_view directly and must not search for or click that UI. open creates a second about:blank tab when only one tab exists. orientation switches between top-bottom and left-right. close keeps the focused tab. swap exchanges panes, assign places a viewId in one pane, focus changes the default tool target, and ratio clamps the first pane to 40%-60%. Tell the user after changing the layout.',
     parameters: {
-      action: { type: 'string', enum: ['status', 'open', 'close', 'swap', 'assign', 'focus', 'ratio'], required: true },
+      action: { type: 'string', enum: ['status', 'open', 'close', 'swap', 'assign', 'focus', 'ratio', 'orientation'], required: true },
       pane: { type: 'string', enum: ['top', 'bottom'] },
+      orientation: { type: 'string', enum: ['top-bottom', 'left-right'] },
       viewId: { type: 'string' },
       ratio: { type: 'number' },
     },
@@ -682,9 +698,10 @@ export function apply(ctx: Context, config: BrowserConfig): void {
       const result = await runtime.splitView(identity(exec), exec.signal, args as unknown as BrowserSplitViewInput)
       if (result.ok && isRecord(result.data) && result.data.changed === true && exec.agent !== undefined) {
         try {
+          const orientationLabel = result.data.orientation === 'left-right' ? '左右' : '上下'
           exec.agent.inject(createUserMessage({
-            content: [{ type: 'text', text: `Agent 已调整右侧浏览器上下双页分屏：${result.data.enabled === true ? `已开启，上方占比 ${Math.round(Number(result.data.ratio) * 100)}%` : '已关闭'}；当前焦点标签 viewId=${result.viewId ?? 'none'}。` }],
-            source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Agent 调整浏览器上下分屏' },
+            content: [{ type: 'text', text: `Agent 已调整右侧浏览器${orientationLabel}双页分屏：${result.data.enabled === true ? `已开启，第一窗格占比 ${Math.round(Number(result.data.ratio) * 100)}%` : '已关闭'}；当前焦点标签 viewId=${result.viewId ?? 'none'}。` }],
+            source: { kind: 'plugin', plugin: name, form: 'notice', summary: `Agent 调整浏览器${orientationLabel}分屏` },
           }))
         } catch {}
       }
@@ -736,14 +753,17 @@ export function apply(ctx: Context, config: BrowserConfig): void {
   })
 
   definitionCollectors.delete(ctx)
-  if (definitions.length !== 30) throw new Error(`browser tool definition count changed unexpectedly: ${definitions.length}`)
 
-  if (resolved.toolRegistrationMode === 'global') {
-    // 兼容模式保持历史语义：Profile 中已有任意 browser_* 工具时拒绝启动，
-    // 避免两个全局控制器同时进入全部 Session 的模型工具面。
-    for (const definition of ctx.tools.schemas()) {
-      if (definition.name.startsWith('browser_')) throw new BrowserError(`browser tool ${definition.name} is already registered`, 'DUPLICATE_BROWSER_TOOL')
-    }
+  const existingBrowserTools = ctx.tools.schemas()
+    .map(definition => definition.name)
+    .filter(toolName => toolName.startsWith('browser_'))
+  if (effectiveToolRegistrationMode === 'global' && existingBrowserTools.length > 0) {
+    // 其他浏览器插件先注册时，抛错会让 Cordis 拒绝整棵插件树并锁死 DSH 启动。
+    // 安全降级只改变 BrowserScope 的注册层级：现有工具继续全局可用，本插件保持未激活，待用户按 Session 显式选择。
+    effectiveToolRegistrationMode = 'session-select'
+  }
+
+  if (effectiveToolRegistrationMode === 'global') {
     registerToolDefinitions(ctx, definitions)
   } else {
     controller = new BrowserControllerStore({
@@ -752,7 +772,6 @@ export function apply(ctx: Context, config: BrowserConfig): void {
       config: resolved.sessionController,
       toolDefinitions: definitions,
       registerTools: (agent, values) => registerToolDefinitions(agent.ctx, values),
-      suspendRuntime: sessionId => runtime.suspendSessionController(sessionId),
       releaseRuntime: (sessionId, sessionCreatedAt) => runtime.disposeSession({ sessionId, sessionCreatedAt }),
       isOwnedTool: toolName => definitions.some(definition => definition.name === toolName),
     })

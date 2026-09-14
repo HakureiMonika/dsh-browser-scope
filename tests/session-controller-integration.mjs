@@ -1,7 +1,8 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 // 默认验证工作树构建；冻结包验收可显式切换到 npm 隔离安装后的包根，确保真实加载字节来自 tarball。
@@ -14,11 +15,15 @@ const home = join(runtimeRoot, 'home')
 const profile = join(home, 'profiles', 'test')
 const modules = join(profile, 'node_modules')
 const artifactRoot = join(runtimeRoot, 'artifacts')
-const dshRootInput = process.env.DSH_ALPHA1_ROOT
-if (dshRootInput === undefined || dshRootInput.trim() === '') {
-  throw new Error('DSH_ALPHA1_ROOT is required for the full Agent Scope integration test')
-}
-const dshRoot = resolve(dshRootInput)
+const require = createRequire(import.meta.url)
+const packageManifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+const installedPackageRoot = name => dirname(require.resolve(`${name}/package.json`))
+const installedPackageEntry = name => require.resolve(name)
+const installedPackages = new Set([
+  ...Object.keys(packageManifest.dependencies ?? {}),
+  ...Object.keys(packageManifest.devDependencies ?? {}),
+].filter(name => name.startsWith('@deepseek-ai/') || name === 'playwright-core'))
+const appBootAnchor = require.resolve('@deepseek-ai/dsh-app-boot/package.json')
 const previousDshHome = process.env.DSH_HOME
 const result = { ok: false, cleanup: { runtimeRemoved: false } }
 let ctx
@@ -36,6 +41,47 @@ function controllerFileName(sessionId) {
   return `${createHash('sha256').update(sessionId).digest('hex')}.json`
 }
 
+function createInbox() {
+  const nextTurn = []
+  const nextStep = []
+  const bucket = target => target === 'next-step' ? nextStep : nextTurn
+  const messageId = message => message?.id ?? message?.messageId
+  const locate = id => {
+    for (const messages of [nextStep, nextTurn]) {
+      const index = messages.findIndex(message => messageId(message) === id)
+      if (index >= 0) return { messages, index }
+    }
+  }
+
+  // RC.1 只公开 Inbox 接口，不再导出内部存储构造器。测试使用内存实现保留标准队列语义，
+  // 但不持久化任何消息；本用例只验证 Agent Scope 与工具仲裁，不把 Inbox 实现细节纳入断言。
+  return {
+    get nextTurn() { return nextTurn },
+    get nextStep() { return nextStep },
+    clear() {
+      nextStep.splice(0)
+      nextTurn.splice(0)
+    },
+    append(target, message) { bucket(target).push(message) },
+    prepend(target, message) { bucket(target).unshift(message) },
+    replace(id, message) {
+      const found = locate(id)
+      if (found === undefined) return false
+      found.messages[found.index] = message
+      return true
+    },
+    remove(id) {
+      const found = locate(id)
+      if (found === undefined) return false
+      found.messages.splice(found.index, 1)
+      return true
+    },
+    splice(target, start, deleteCount, inserted) {
+      return bucket(target).splice(start, deleteCount, ...inserted)
+    },
+  }
+}
+
 const packageName = 'dsh-browser-scope'
 
 try {
@@ -45,6 +91,7 @@ try {
   mkdirSync(join(modules, '@deepseek-ai'), { recursive: true })
   mkdirSync(join(modules, packageName, 'lib'), { recursive: true })
   mkdirSync(join(modules, 'browser-test-connection'), { recursive: true })
+  mkdirSync(join(modules, 'browser-test-permission-presets'), { recursive: true })
   mkdirSync(join(modules, 'browser-test-third-party'), { recursive: true })
 
   // 只复制当前构建产物到隔离 Profile，保证测试验证的是 DSH 实际加载路径，而不是源码直调。
@@ -54,18 +101,23 @@ try {
   copyFileSync(join(packageSourceRoot, 'lib', 'index.mjs'), join(modules, packageName, 'lib', 'index.mjs'))
   copyFileSync(join(packageSourceRoot, 'lib', 'index.d.mts'), join(modules, packageName, 'lib', 'index.d.mts'))
 
-  link(join(dshRoot, 'vendor', 'cordis'), join(modules, '@deepseek-ai', 'cordis'))
-  link(join(dshRoot, 'vendor', 'schemastery'), join(modules, '@deepseek-ai', 'schemastery'))
-  link(join(dshRoot, 'packages', 'core', 'system-prompt'), join(modules, '@deepseek-ai', 'dsh-system-prompt'))
-  link(join(dshRoot, 'packages', 'core', 'tools'), join(modules, '@deepseek-ai', 'dsh-tools'))
-  link(join(dshRoot, 'packages', 'core', 'scope'), join(modules, '@deepseek-ai', 'dsh-scope'))
-  link(join(dshRoot, 'packages', 'core', 'agent'), join(modules, '@deepseek-ai', 'dsh-agent'))
-  link(join(dshRoot, 'packages', 'core', 'session'), join(modules, '@deepseek-ai', 'dsh-session'))
-  link(join(dshRoot, 'packages', 'llm', 'llm'), join(modules, '@deepseek-ai', 'dsh-llm'))
-  link(join(dshRoot, 'packages', 'attachment', 'attachment'), join(modules, '@deepseek-ai', 'dsh-attachment'))
-  link(join(dshRoot, 'packages', 'attachment', 'attachment-local'), join(modules, '@deepseek-ai', 'dsh-attachment-local'))
-  link(join(dshRoot, 'packages', 'util', 'home-paths'), join(modules, '@deepseek-ai', 'dsh-home-paths'))
-  link(join(dshRoot, 'node_modules', '.pnpm', 'playwright-core@1.61.1', 'node_modules', 'playwright-core'), join(modules, 'playwright-core'))
+  // 隔离 Profile 只链接当前项目已经锁定的 npm 包；所有包从消费者入口解析，避免依赖 DSH 单仓目录结构或 pnpm 虚拟目录名。
+  for (const name of installedPackages) {
+    if (name === packageName) continue
+    link(installedPackageRoot(name), join(modules, ...name.split('/')))
+  }
+
+  writeFileSync(join(modules, 'browser-test-permission-presets', 'package.json'), JSON.stringify({
+    name: 'browser-test-permission-presets',
+    version: '0.0.0',
+    type: 'module',
+    main: './index.mjs',
+  }, null, 2))
+  writeFileSync(join(modules, 'browser-test-permission-presets', 'index.mjs'), [
+    "export function apply(ctx) {",
+    "  ctx.provide('permissionPresets', { current: () => undefined })",
+    "}",
+  ].join('\n'))
 
   writeFileSync(join(modules, 'browser-test-connection', 'package.json'), JSON.stringify({
     name: 'browser-test-connection',
@@ -76,10 +128,17 @@ try {
   writeFileSync(join(modules, 'browser-test-connection', 'index.mjs'), [
     "export function apply(ctx) {",
     "  ctx.provide('connection', {",
-    "    rpc: {",
-    "      handle(channel, handler) {",
-    "        globalThis.__sessionControllerRpc = { channel, handler }",
-    "        return () => { globalThis.__sessionControllerRpc = undefined }",
+    "    fetch: {",
+    "      register(route) {",
+    "        globalThis.__sessionControllerRpc = {",
+    "          path: route.path,",
+    "          handler: async (endpoint, payload, signal) => {",
+    "            const rpcId = `session-controller-${endpoint}`",
+    "            const response = await route.fetch(new Request('http://dsh.internal/api/browser-tools', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId, method: 'browser-tools', payload: { endpoint, payload } }), signal }))",
+    "            return (await response.json()).result",
+    "          },",
+    "        }",
+    "        return async () => { globalThis.__sessionControllerRpc = undefined }",
     "      },",
     "    },",
     "  })",
@@ -112,48 +171,55 @@ try {
     dsh: { profile: { bundles: [packageName] } },
   }, null, 2))
   writeFileSync(join(profile, 'cordis.patch.yml'), '[]\n')
+  const isolatedPackageEntry = join(modules, packageName, 'lib', 'index.mjs')
+  const connectionEntry = join(modules, 'browser-test-connection', 'index.mjs')
+  const permissionPresetsEntry = join(modules, 'browser-test-permission-presets', 'index.mjs')
+  const thirdPartyEntry = join(modules, 'browser-test-third-party', 'index.mjs')
   writeFileSync(join(modules, packageName, 'cordis.patch.yml'), [
     '- insert:',
     '    - id: system-prompt',
-    "      name: '@deepseek-ai/dsh-system-prompt'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-system-prompt'))}`,
     '      config:',
     '        includeHarnessIdentity: false',
     '        includeRuntimeContext: false',
     "        persona: ''",
     '    - id: attachments',
-    "      name: '@deepseek-ai/dsh-attachment-local'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-attachment-local'))}`,
     '      config:',
     `        dshHome: ${JSON.stringify(home)}`,
     '    - id: tools',
-    "      name: '@deepseek-ai/dsh-tools'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-tools'))}`,
     '    - id: sessions',
-    "      name: '@deepseek-ai/dsh-session'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-session'))}`,
     '    - id: agent',
-    "      name: '@deepseek-ai/dsh-agent'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-agent'))}`,
     '    - id: connection',
-    '      name: browser-test-connection',
+    `      name: ${JSON.stringify(connectionEntry)}`,
+    '    - id: permission-presets',
+    `      name: ${JSON.stringify(permissionPresetsEntry)}`,
     '    - id: third-party',
-    '      name: browser-test-third-party',
+    `      name: ${JSON.stringify(thirdPartyEntry)}`,
     '    - id: browser-tools',
-    `      name: ${packageName}`,
+    `      name: ${JSON.stringify(isolatedPackageEntry)}`,
     '      config:',
     '        toolRegistrationMode: session-select',
-    '        sessionController:',
-    '          defaultMode: other',
     `        artifactRoot: ${JSON.stringify(artifactRoot)}`,
   ].join('\n') + '\n')
 
-  const appBoot = await import(pathToFileURL(join(dshRoot, 'packages', 'boot', 'app-boot', 'lib', 'index.js')).href)
-  const llm = await import(pathToFileURL(join(dshRoot, 'packages', 'llm', 'llm', 'lib', 'index.js')).href)
-  const sessionApi = await import(pathToFileURL(join(dshRoot, 'packages', 'core', 'session', 'lib', 'index.js')).href)
-  const agentApi = await import(pathToFileURL(join(dshRoot, 'packages', 'core', 'agent', 'lib', 'index.js')).href)
-  const scopeApi = await import(pathToFileURL(join(dshRoot, 'packages', 'core', 'scope', 'lib', 'index.js')).href)
+  const appBoot = await import('@deepseek-ai/dsh-app-boot')
+  const llm = await import('@deepseek-ai/dsh-llm')
+  const sessionApi = await import('@deepseek-ai/dsh-session')
+  const scopeApi = await import('@deepseek-ai/dsh-scope')
 
-  const loaded = appBoot.loadProfile('session-controller-integration', 'test', join(dshRoot, 'apps', 'cli', 'package.json'), home)
-  ctx = await appBoot.boot('session-controller-integration', join(profile, 'cordis.patch.yml'), loaded.layers.flatMap(layer => layer.patches))
+  const loaded = appBoot.loadProfile('session-controller-integration', 'test', appBootAnchor, home)
+  ctx = await appBoot.boot(
+    'session-controller-integration',
+    join(profile, 'cordis.patch.yml'),
+    loaded.layers.flatMap(layer => layer.patches),
+  )
   const tools = ctx.get('tools')
   const rpcRegistration = globalThis.__sessionControllerRpc
-  assert(rpcRegistration?.channel === '/browser-tools', 'Controller RPC channel was not registered')
+  assert(rpcRegistration?.path === '/api/browser-tools', 'Controller authenticated Fetch RPC route was not registered')
 
   // 使用 DSH 官方 Scope primitive 和 Agent Registry，确保 Schema 合并、执行分发与生命周期均走真实实现。
   async function createAgent(rawId) {
@@ -162,7 +228,7 @@ try {
       id: session.id,
       options: {},
       session,
-      inbox: new agentApi.Inbox(session, { inserted: () => {}, discarded: () => {}, claimed: () => {} }),
+      inbox: createInbox(),
       status: 'idle',
       send: () => {},
       followup: () => {},
@@ -198,44 +264,53 @@ try {
   }
 
   assert(tools.schemas().filter(schema => schema.name.startsWith('browser_')).length === 3, 'session-select incorrectly registered owned browser tools globally')
-  assert(tools.schemas(first.agent).find(schema => schema.name === 'browser_tabs')?.description === 'third-party:browser_tabs', 'other Session did not retain third-party same-name tool')
-  assert(tools.schemas(first.agent).some(schema => schema.name === 'browser_auth'), 'other Session did not retain third-party unique tool')
-  const beforeThirdParty = await execute(first.agent, 'before-third-party', 'browser_tabs')
-  assert(beforeThirdParty.isError === false && beforeThirdParty.value.owner === 'third-party', 'other Session did not execute third-party same-name tool')
-  // browser_navigate historically需要本插件 Approval；other 模式下它属于第三方，必须绕过本插件所有权策略直接执行。
-  const thirdPartyNavigate = await execute(first.agent, 'third-party-navigate', 'browser_navigate')
-  assert(thirdPartyNavigate.isError === false && thirdPartyNavigate.value.owner === 'third-party', 'plugin approval policy incorrectly intercepted third-party browser_navigate')
+  // controller_status 会等待对应 Agent Scope 的持久状态恢复；工具面断言必须在就绪门之后执行，避免把异步 attach 时序误判为选择门失败。
+  const initial = await rpc('controller_status', first.agent.id)
+  const siblingInitial = await rpc('controller_status', second.agent.id)
+  assert(initial.registrationMode === 'session-select' && initial.mode === 'unselected' && initial.selectionLocked === false, 'initial browser selection status is incorrect')
+  assert(siblingInitial.registrationMode === 'session-select' && siblingInitial.mode === 'unselected' && siblingInitial.selectionLocked === false, 'sibling initial browser selection status is incorrect')
+  // 新 Session 在用户选择前不暴露任何浏览器工具，避免 Agent 抢先使用某个插件并形成混合状态。
+  assert(tools.schemas(first.agent).filter(schema => schema.name.startsWith('browser_')).length === 0, 'unselected Session exposed browser tools before user selection')
+  assert(tools.schemas(second.agent).filter(schema => schema.name.startsWith('browser_')).length === 0, 'sibling unselected Session exposed browser tools before user selection')
 
   const inactiveSnapshot = await rpcRegistration.handler('snapshot', { sessionId: first.agent.id, view: 'live' }, new AbortController().signal)
-  assert(inactiveSnapshot.ok === false && inactiveSnapshot.error.message.includes('尚未启用'), 'other mode did not reject full snapshot RPC before browser resource creation')
-  const initial = await rpc('controller_status', first.agent.id)
-  assert(initial.registrationMode === 'session-select' && initial.mode === 'other' && initial.status === 'inactive', 'initial Controller status is incorrect')
+  assert(inactiveSnapshot.ok === false && inactiveSnapshot.error.message.includes('尚未启用'), 'unselected mode did not reject full snapshot RPC before browser resource creation')
+
+  // Session A 首次选择 BrowserScope 后永久锁定，只暴露本插件 30 个工具。
   const activated = await rpc('controller_activate', first.agent.id)
-  assert(activated.status === 'active' && activated.generation === 1, `Controller activation status is incorrect: ${JSON.stringify(activated)}`)
+  assert(activated.status === 'active' && activated.generation === 1 && activated.selectionLocked === true, `BrowserScope selection status is incorrect: ${JSON.stringify(activated)}`)
   assert(activated.shadowedTools.includes('browser_tabs'), 'same-name third-party tool was not classified as shadowed')
   assert(activated.restrictedTools.includes('browser_auth'), 'third-party unique tool was not classified as restricted')
-  assert(tools.schemas(first.agent).filter(schema => schema.name.startsWith('browser_')).length === 30, 'active Session does not expose exactly 30 owned browser tools')
+  assert(tools.schemas(first.agent).filter(schema => schema.name.startsWith('browser_')).length === 30, 'BrowserScope Session does not expose exactly 30 owned browser tools')
   assert(tools.schemas(first.agent).find(schema => schema.name === 'browser_tabs')?.description !== 'third-party:browser_tabs', 'owned Agent tool did not shadow third-party same-name tool')
-  assert(!tools.schemas(first.agent).some(schema => schema.name === 'browser_auth'), 'third-party unique tool remained visible in active Session')
-  const restrictedExecution = await execute(first.agent, 'restricted-third-party', 'browser_auth')
-  assert(restrictedExecution.isError === true && restrictedExecution.error.message.includes('unknown tool'), 'restricted third-party tool remained executable')
+  assert(!tools.schemas(first.agent).some(schema => schema.name === 'browser_auth'), 'third-party unique tool remained visible in BrowserScope Session')
 
-  // 第二个 Session 必须继续看到并执行第三方工具，证明 restriction 和 shadow 均为 Agent Scope 局部效果。
-  assert(tools.schemas(second.agent).find(schema => schema.name === 'browser_tabs')?.description === 'third-party:browser_tabs', 'active Session polluted sibling same-name tool')
-  assert(tools.schemas(second.agent).some(schema => schema.name === 'browser_auth'), 'active Session polluted sibling unique tool')
+  const blockedChange = await rpcRegistration.handler('controller_select_other', { sessionId: first.agent.id }, new AbortController().signal)
+  assert(blockedChange.ok === false && blockedChange.error.message.includes('新建 Session'), 'locked BrowserScope Session incorrectly allowed changing browser plugin')
+
+  // 释放 BrowserScope 页面和运行资源后，工具选择仍保持 BrowserScope。
+  const released = await rpc('controller_release', first.agent.id)
+  assert(released.mode === 'dsh-browser-tools' && released.status === 'active' && released.generation === 1, 'resource release incorrectly changed BrowserScope selection')
+  assert(tools.schemas(first.agent).filter(schema => schema.name.startsWith('browser_')).length === 30, 'resource release removed BrowserScope tools')
+  assert(!tools.schemas(first.agent).some(schema => schema.name === 'browser_auth'), 'resource release restored third-party browser tools')
+
+  // Session B 独立选择其他浏览器工具，第三方工具恢复并永久锁定。
+  const selectedOther = await rpc('controller_select_other', second.agent.id)
+  assert(selectedOther.mode === 'other' && selectedOther.status === 'inactive' && selectedOther.selectionLocked === true, 'other browser selection status is incorrect')
+  assert(tools.schemas(second.agent).find(schema => schema.name === 'browser_tabs')?.description === 'third-party:browser_tabs', 'other browser selection did not restore third-party same-name tool')
+  assert(tools.schemas(second.agent).some(schema => schema.name === 'browser_auth'), 'other browser selection did not restore third-party unique tool')
   const siblingThirdParty = await execute(second.agent, 'sibling-third-party', 'browser_auth')
-  assert(siblingThirdParty.isError === false && siblingThirdParty.value.owner === 'third-party', 'sibling Session could not execute third-party unique tool')
+  assert(siblingThirdParty.isError === false && siblingThirdParty.value.owner === 'third-party', 'other browser Session could not execute third-party tool')
 
-  const deactivated = await rpc('controller_deactivate', first.agent.id)
-  assert(deactivated.status === 'inactive' && deactivated.generation === 2, 'Controller deactivation status is incorrect')
-  assert(tools.schemas(first.agent).find(schema => schema.name === 'browser_tabs')?.description === 'third-party:browser_tabs', 'deactivation did not restore third-party same-name tool')
-  assert(tools.schemas(first.agent).some(schema => schema.name === 'browser_auth'), 'deactivation did not restore third-party unique tool')
-  const restoredThirdParty = await execute(first.agent, 'restored-third-party', 'browser_tabs')
-  assert(restoredThirdParty.isError === false && restoredThirdParty.value.owner === 'third-party', 'deactivation did not restore third-party execution dispatch')
+  const blockedBrowserScope = await rpcRegistration.handler('controller_activate', { sessionId: second.agent.id }, new AbortController().signal)
+  assert(blockedBrowserScope.ok === false && blockedBrowserScope.error.message.includes('新建 Session'), 'locked other-browser Session incorrectly allowed BrowserScope selection')
 
-  const persistedPath = join(home, 'browser-tools', 'controller', 'sessions', controllerFileName(first.agent.id))
-  const persisted = JSON.parse(readFileSync(persistedPath, 'utf8'))
-  assert(persisted.mode === 'other' && persisted.generation === 2, 'Controller persisted state is incorrect')
+  const persistedFirstPath = join(home, 'browser-tools', 'controller', 'sessions', controllerFileName(first.agent.id))
+  const persistedSecondPath = join(home, 'browser-tools', 'controller', 'sessions', controllerFileName(second.agent.id))
+  const persistedFirst = JSON.parse(readFileSync(persistedFirstPath, 'utf8'))
+  const persistedSecond = JSON.parse(readFileSync(persistedSecondPath, 'utf8'))
+  assert(persistedFirst.schemaVersion === 2 && persistedFirst.mode === 'dsh-browser-tools' && persistedFirst.generation === 1, 'BrowserScope persisted selection is incorrect')
+  assert(persistedSecond.schemaVersion === 2 && persistedSecond.mode === 'other' && persistedSecond.generation === 1, 'other browser persisted selection is incorrect')
 
   // 对齐真实 AgentLoop：先等待 Agent Scope 撤销 scoped 注册，再从 Registry 发出 agent/disposed。
   await first.scope.dispose()
@@ -247,14 +322,16 @@ try {
   result.ok = true
   result.stages = {
     globalBrowserToolCount: 3,
+    unselectedBrowserToolCount: 0,
     activeBrowserToolCount: 30,
+    browserScopeSelectionLocked: true,
+    otherBrowserSelectionLocked: true,
+    releasePreservedSelection: true,
     sameNameShadowed: true,
     uniqueThirdPartyRestricted: true,
-    thirdPartyApprovalUnaffected: true,
     inactiveSnapshotRejected: true,
-    siblingSessionUnaffected: true,
-    deactivationRestoredThirdParty: true,
-    persistedGeneration: persisted.generation,
+    browserScopePersistedGeneration: persistedFirst.generation,
+    otherBrowserPersistedGeneration: persistedSecond.generation,
   }
 } catch (error) {
   result.error = {

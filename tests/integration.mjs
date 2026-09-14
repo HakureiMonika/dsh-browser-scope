@@ -1,10 +1,11 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { createHash, generateKeyPairSync } from 'node:crypto'
+import { createRequire } from 'node:module'
 import http from 'node:http'
 import net from 'node:net'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -17,12 +18,15 @@ const runtime = join(root, '.runtime')
 const home = join(runtime, 'home')
 const profile = join(home, 'profiles', 'test')
 const modules = join(profile, 'node_modules')
-// 完整集成依赖维护者本机的 DSH Alpha 1 源码树；必须显式注入，避免公开测试静默绑定某台机器的目录结构。
-const dshRootInput = process.env.DSH_ALPHA1_ROOT
-if (dshRootInput === undefined || dshRootInput.trim() === '') {
-  throw new Error('DSH_ALPHA1_ROOT is required for the full browser integration test')
-}
-const dshRoot = resolve(dshRootInput)
+const require = createRequire(import.meta.url)
+const packageManifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+const installedPackageRoot = name => dirname(require.resolve(`${name}/package.json`))
+const installedPackageEntry = name => require.resolve(name)
+const installedPackages = new Set([
+  ...Object.keys(packageManifest.dependencies ?? {}),
+  ...Object.keys(packageManifest.devDependencies ?? {}),
+].filter(name => name.startsWith('@deepseek-ai/') || name === 'playwright-core'))
+const appBootAnchor = require.resolve('@deepseek-ai/dsh-app-boot/package.json')
 const artifactRoot = join(runtime, 'artifacts')
 // 浏览器集成复用已验收的离线 Chromium 缓存，禁止回归过程隐式下载，也禁止把内部 .acceptance 路径写入公开源码。
 const chromiumRootInput = process.env.DSH_BROWSER_SCOPE_CHROMIUM_ROOT
@@ -106,6 +110,8 @@ function fakeAgent(id, origin) {
       id,
       header: { id, createdAt: id === 'a' ? 1 : 2, ...(origin === undefined ? {} : { origin }) },
       events,
+      get seq() { return events.length },
+      eventAt(sequence) { return events[Number(sequence)] },
       append(type, data) { const event = { type, data }; events.push(event); return event },
     },
   }
@@ -178,20 +184,22 @@ try {
       && clientSource.includes('!loadingController && !active && !confirmActivate'),
     'controller loading state can still be misreported as other or expose activation actions early',
   )
-  // DSH 的空白 Hero Session 会在首条消息后切换到新的正式 Session ID；该契约同时锁定：
-  // 严格 details Slot 门禁、Controller 快照身份绑定、空白 Session 禁止激活以及身份切换关闭旧分屏。
+  // DSH 的空白 Hero Session 会在首条消息后切换为正式 Session；RC.1 的右侧栏状态按 Session 保存，
+  // 因此门禁必须同时锁定 Hero 禁用、Controller 快照身份绑定、Tab 生命周期回报，以及切换 Session 时不误关旧标签。
   assert(
-    clientSource.includes('const currentSessionId = useSessions(state => state.current)')
-      && clientSource.includes('const panelAvailable = currentSessionId === sessionId && currentSessionBlank === false')
+    clientSource.includes("const currentSessionBlank = useSession((state: { readonly blank: boolean }) => state.blank)")
+      && clientSource.includes('const panelAvailable = currentSessionBlank === false')
       && clientSource.includes('controllerBinding?.sessionId === sessionId')
       && clientSource.includes('setControllerBinding({ sessionId, snapshot })')
-      && clientSource.includes('controller.close()')
+      && clientSource.includes('return controller.subscribe(sessionId, state =>')
+      && clientSource.includes('controller.attach(')
+      && clientSource.includes('controller.update(sessionId, tab.id, view)')
+      && clientSource.includes('不能因为输入区组件切换身份就关闭旧 Session 的标签')
       && clientSource.includes('void port.close(sessionId, view).catch(() => {})')
-      && clientSource.includes('void port.close(activeSessionId, activeView).catch(() => {})')
       && clientSource.includes('disabled={switching || !panelAvailable}')
       && clientSource.includes('当前会话使用临时空白 Session')
       && clientSource.includes('当前会话尚未形成正式 Agent Session'),
-    'blank-to-formal session identity can still reuse a stale controller snapshot or expose the wrong browser panel',
+    'blank-to-formal session identity can still reuse a stale controller snapshot or close the wrong RC.1 sidebar tab',
   )
   assert(
     controllerSource.includes('bindingGeneration')
@@ -220,32 +228,44 @@ try {
   mkdirSync(join(modules, '@deepseek-ai'), { recursive: true })
   mkdirSync(join(modules, packageName), { recursive: true })
   mkdirSync(join(modules, 'browser-test-connection'), { recursive: true })
+  mkdirSync(join(modules, 'browser-test-permission-presets'), { recursive: true })
   for (const file of ['package.json', 'cordis.patch.yml']) copyFileSync(join(packageSourceRoot, file), join(modules, packageName, file))
   mkdirSync(join(modules, packageName, 'lib'), { recursive: true })
   copyFileSync(join(packageSourceRoot, 'lib', 'index.mjs'), join(modules, packageName, 'lib', 'index.mjs'))
   copyFileSync(join(packageSourceRoot, 'lib', 'index.d.mts'), join(modules, packageName, 'lib', 'index.d.mts'))
-  link(join(dshRoot, 'vendor', 'cordis'), join(modules, '@deepseek-ai', 'cordis'))
-  link(join(dshRoot, 'vendor', 'schemastery'), join(modules, '@deepseek-ai', 'schemastery'))
-  link(join(dshRoot, 'packages', 'core', 'system-prompt'), join(modules, '@deepseek-ai', 'dsh-system-prompt'))
-  link(join(dshRoot, 'packages', 'core', 'tools'), join(modules, '@deepseek-ai', 'dsh-tools'))
-  link(join(dshRoot, 'packages', 'core', 'agent'), join(modules, '@deepseek-ai', 'dsh-agent'))
-  link(join(dshRoot, 'packages', 'core', 'scope'), join(modules, '@deepseek-ai', 'dsh-scope'))
-  link(join(dshRoot, 'packages', 'runtime-diagnostics', 'invariants'), join(modules, '@deepseek-ai', 'dsh-invariants'))
-  link(join(dshRoot, 'packages', 'typert', 'protocol'), join(modules, '@deepseek-ai', 'dsh-typert-protocol'))
-  link(join(dshRoot, 'packages', 'llm', 'llm'), join(modules, '@deepseek-ai', 'dsh-llm'))
-  link(join(dshRoot, 'packages', 'core', 'session'), join(modules, '@deepseek-ai', 'dsh-session'))
-  link(join(dshRoot, 'packages', 'attachment', 'attachment'), join(modules, '@deepseek-ai', 'dsh-attachment'))
-  link(join(dshRoot, 'packages', 'attachment', 'attachment-local'), join(modules, '@deepseek-ai', 'dsh-attachment-local'))
-  link(join(dshRoot, 'packages', 'util', 'home-paths'), join(modules, '@deepseek-ai', 'dsh-home-paths'))
-  link(join(dshRoot, 'packages', 'interaction', 'user-approval'), join(modules, '@deepseek-ai', 'dsh-user-approval'))
-  link(join(dshRoot, 'node_modules', '.pnpm', 'playwright-core@1.61.1', 'node_modules', 'playwright-core'), join(modules, 'playwright-core'))
+  // 完整集成使用当前项目锁定的 RC.1 npm 包，按消费者入口解析后链接到隔离 Profile；禁止依赖工作区外 DSH 源码树。
+  for (const name of installedPackages) {
+    if (name === packageName) continue
+    link(installedPackageRoot(name), join(modules, ...name.split('/')))
+  }
+  writeFileSync(join(modules, 'browser-test-permission-presets', 'package.json'), JSON.stringify({
+    name: 'browser-test-permission-presets',
+    version: '0.0.0',
+    type: 'module',
+    main: './index.mjs',
+  }, null, 2))
+  writeFileSync(join(modules, 'browser-test-permission-presets', 'index.mjs'), [
+    "export function apply(ctx) {",
+    "  ctx.provide('permissionPresets', { current: session => String(session.id).includes('full-access') ? 'danger-full-access' : undefined })",
+    "}",
+  ].join('\n'))
   writeFileSync(join(modules, 'browser-test-connection', 'package.json'), JSON.stringify({ name: 'browser-test-connection', version: '0.0.0', type: 'module', main: './index.mjs' }, null, 2))
   writeFileSync(join(modules, 'browser-test-connection', 'index.mjs'), [
     "export function apply(ctx) {",
     "  ctx.provide('connection', {",
-    "    rpc: {",
-    "      handle(channel, handler, options) {",
-    "        globalThis.__browserToolsRpc = { channel, handler, options, removed: false }",
+    "    fetch: {",
+    "      register(route) {",
+    "        globalThis.__browserToolsRpc = {",
+    "          path: route.path,",
+    "          methods: route.methods,",
+    "          requestBody: route.requestBody,",
+    "          removed: false,",
+    "          handler: async (endpoint, payload, signal) => {",
+    "            const rpcId = `browser-tools-${endpoint}`",
+    "            const response = await route.fetch(new Request('http://dsh.internal/api/browser-tools', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId, method: 'browser-tools', payload: { endpoint, payload } }), signal }))",
+    "            return (await response.json()).result",
+    "          },",
+    "        }",
     "        return async () => { globalThis.__browserToolsRpc.removed = true }",
     "      },",
     "    },",
@@ -279,30 +299,35 @@ try {
 
   writeFileSync(join(profile, 'package.json'), JSON.stringify({ name: 'browser-scope-test-profile', private: true, dsh: { profile: { bundles: [packageName] } } }, null, 2))
   writeFileSync(join(profile, 'cordis.patch.yml'), '[]\n')
+  const isolatedPackageEntry = join(modules, packageName, 'lib', 'index.mjs')
+  const connectionEntry = join(modules, 'browser-test-connection', 'index.mjs')
+  const permissionPresetsEntry = join(modules, 'browser-test-permission-presets', 'index.mjs')
   const patch = [
     '- insert:',
     '    - id: system-prompt',
-    "      name: '@deepseek-ai/dsh-system-prompt'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-system-prompt'))}`,
     '      config:',
     '        includeHarnessIdentity: false',
     '        includeRuntimeContext: false',
     "        persona: ''",
     '    - id: attachments',
-    "      name: '@deepseek-ai/dsh-attachment-local'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-attachment-local'))}`,
     '      config:',
     `        dshHome: ${JSON.stringify(home)}`,
     '    - id: tools',
-    "      name: '@deepseek-ai/dsh-tools'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-tools'))}`,
     '    - id: sessions',
-    "      name: '@deepseek-ai/dsh-session'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-session'))}`,
     '    - id: agent',
-    "      name: '@deepseek-ai/dsh-agent'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-agent'))}`,
     '    - id: approval',
-    "      name: '@deepseek-ai/dsh-user-approval'",
+    `      name: ${JSON.stringify(installedPackageEntry('@deepseek-ai/dsh-user-approval'))}`,
     '    - id: connection',
-    '      name: browser-test-connection',
+    `      name: ${JSON.stringify(connectionEntry)}`,
+    '    - id: permission-presets',
+    `      name: ${JSON.stringify(permissionPresetsEntry)}`,
     '    - id: browser-tools',
-    `      name: ${packageName}`,
+    `      name: ${JSON.stringify(isolatedPackageEntry)}`,
     '      config:',
     '        allowLoopback: true',
     `        allowedOrigins: [${JSON.stringify(origin)}]`,
@@ -311,10 +336,10 @@ try {
   ].join('\n') + '\n'
   writeFileSync(join(modules, packageName, 'cordis.patch.yml'), patch)
 
-  const appBoot = await import(pathToFileURL(join(dshRoot, 'packages', 'boot', 'app-boot', 'lib', 'index.js')).href)
-  const llm = await import(pathToFileURL(join(dshRoot, 'packages', 'llm', 'llm', 'lib', 'index.js')).href)
-  const sessionApi = await import(pathToFileURL(join(dshRoot, 'packages', 'core', 'session', 'lib', 'index.js')).href)
-  const loaded = appBoot.loadProfile('dsh-browser-scope-test', 'test', join(dshRoot, 'apps', 'cli', 'package.json'), home)
+  const appBoot = await import('@deepseek-ai/dsh-app-boot')
+  const llm = await import('@deepseek-ai/dsh-llm')
+  const sessionApi = await import('@deepseek-ai/dsh-session')
+  const loaded = appBoot.loadProfile('dsh-browser-scope-test', 'test', appBootAnchor, home)
   ctx = await appBoot.boot('dsh-browser-scope-test', join(profile, 'cordis.patch.yml'), loaded.layers.flatMap(layer => layer.patches))
   const tools = ctx.get('tools')
   const browserSchemas = tools.schemas().filter(tool => tool.name.startsWith('browser_'))
@@ -333,13 +358,19 @@ try {
     && diagnoseSchema.sinceCheckpointId !== undefined
     && diagnoseSchema.sinceCursor !== undefined,
   'browser_diagnose schema is missing stage 2A actions or incremental range parameters')
+  const diagnoseDescription = String(schemaByName.get('browser_diagnose')?.description)
+  // 完成指导必须保留通用的身份×顺序×上下文反例矩阵，防止模型只用同身份样例证明单调性。
+  for (const phrase of ['same-identity tests alone', 'identity unchanged/changed', 'evidence claims must not exceed']) {
+    assert(diagnoseDescription.includes(phrase), `browser_diagnose description is missing acceptance guidance: ${phrase}`)
+  }
   for (const name of ['browser_snapshot', 'browser_click', 'browser_type', 'browser_press_key', 'browser_wait_for', 'browser_handle_dialog', 'browser_takeover']) {
     const description = String(schemaByName.get(name)?.description)
     assert(description.includes('CAPTCHA') && description.includes('Passkey'), `${name} is missing security verification takeover guidance`)
   }
   const rpcRegistration = globalThis.__browserToolsRpc
-  assert(rpcRegistration?.channel === '/browser-tools', 'browser panel RPC channel was not registered')
-  assert(rpcRegistration?.options?.authority === 'loopback', 'browser panel RPC channel did not preserve the old-RC loopback trust policy')
+  assert(rpcRegistration?.path === '/api/browser-tools', 'browser panel authenticated Fetch RPC route was not registered')
+  assert(rpcRegistration?.methods?.length === 1 && rpcRegistration.methods[0] === 'POST', 'browser panel RPC route must accept POST only')
+  assert(rpcRegistration?.requestBody === 'buffered', 'browser panel RPC route must use the authenticated buffered JSON carrier')
   const primaryViews = new Map()
   const rpc = async (endpoint, payload) => {
     const primaryViewId = primaryViews.get(payload.sessionId)
@@ -376,7 +407,7 @@ try {
   const persistentCacheAgent = fakeAgent('persistent-cache')
   const fullAccessAgent = fakeAgent('full-access')
   const noChannel = await tools.execute({ agent: a, callId: llm.ToolCallId('no-channel'), name: 'browser_navigate', arguments: { url: origin }, signal: new AbortController().signal })
-  assert(noChannel.isError === true && noChannel.error.message.includes('no approval channel'), 'missing approval channel did not fail closed')
+  assert(noChannel.isError === true, `missing approval answerer did not fail closed: ${JSON.stringify(noChannel)}`)
   a.session.append('approval/policy', { policy: 'never' })
   let neverCalled = false
   const neverAnswerer = ctx.on('approval/request', () => { neverCalled = true; return Promise.resolve('allowed-once') })
@@ -386,7 +417,6 @@ try {
   const neverBlankBefore = await tools.execute({ agent: a, callId: llm.ToolCallId('never-blank-before'), name: 'browser_tabs', arguments: { action: 'list' }, signal: new AbortController().signal })
   const neverBlankTab = await tools.execute({ agent: a, callId: llm.ToolCallId('never-blank-tab'), name: 'browser_tabs', arguments: { action: 'new', url: 'about:blank' }, signal: new AbortController().signal })
   const neverBlankClose = await tools.execute({ agent: a, callId: llm.ToolCallId('never-blank-close'), name: 'browser_tabs', arguments: { action: 'close', viewId: neverBlankTab.value?.viewId }, signal: new AbortController().signal })
-  fullAccessAgent.session.append('permission/preset', { preset: 'danger-full-access' })
   fullAccessAgent.session.append('approval/policy', { policy: 'never' })
   const fullAccessNavigation = await tools.execute({ agent: fullAccessAgent, callId: llm.ToolCallId('full-access-navigation'), name: 'browser_navigate', arguments: { url: origin }, signal: new AbortController().signal })
   const fullAccessExtensionEnable = await tools.execute({ agent: fullAccessAgent, callId: llm.ToolCallId('full-access-extension-enable'), name: 'browser_extensions', arguments: { action: 'enable', extensionId: seededExtensionFullAccess, applyMode: 'next_start' }, signal: new AbortController().signal })
@@ -414,7 +444,7 @@ try {
     return response
   }
   const persistentCacheNav = await call(persistentCacheAgent, 'persistent-cache-nav', 'browser_navigate', { url: origin })
-  assert(persistentCacheNav.isError === false, 'default persistent cache session navigation failed')
+  assert(persistentCacheNav.isError === false, `default persistent cache session navigation failed: ${JSON.stringify(persistentCacheNav)}`)
   const persistentCacheSeed = await call(persistentCacheAgent, 'persistent-cache-seed', 'browser_evaluate', {
     action: 'main_world',
     expression: `(async () => {

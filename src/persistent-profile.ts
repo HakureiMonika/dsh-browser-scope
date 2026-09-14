@@ -18,9 +18,22 @@ interface BrowserExtensionRegistry {
   extensions: BrowserExtensionRecord[]
 }
 
-interface BrowserSplitViewPreference {
+export type BrowserSplitViewOrientation = 'top-bottom' | 'left-right'
+
+interface BrowserSplitViewPreferenceV1 {
   version: 1
   ratio: number
+}
+
+interface BrowserSplitViewPreferenceV2 {
+  version: 2
+  ratio: number
+  orientation: BrowserSplitViewOrientation
+}
+
+export interface BrowserSplitViewPreference {
+  ratio: number
+  orientation: BrowserSplitViewOrientation
 }
 
 function profileSegment(sessionId: string): string {
@@ -79,24 +92,28 @@ export class PersistentProfileStore {
     return join(this.root, 'layout', 'sessions', profileSegment(sessionId), 'split-view.json')
   }
 
-  async splitViewRatio(sessionId: string): Promise<number> {
+  async splitViewPreference(sessionId: string): Promise<BrowserSplitViewPreference> {
     try {
-      const parsed = JSON.parse(await readFile(this.splitViewPreferencePath(sessionId), 'utf8')) as Partial<BrowserSplitViewPreference>
-      if (parsed.version !== 1 || typeof parsed.ratio !== 'number' || !Number.isFinite(parsed.ratio)) return 0.5
-      return Math.min(Math.max(parsed.ratio, 0.4), 0.6)
+      const parsed = JSON.parse(await readFile(this.splitViewPreferencePath(sessionId), 'utf8')) as Partial<BrowserSplitViewPreferenceV1 | BrowserSplitViewPreferenceV2>
+      if (typeof parsed.ratio !== 'number' || !Number.isFinite(parsed.ratio)) return { ratio: 0.5, orientation: 'top-bottom' }
+      const ratio = Math.min(Math.max(parsed.ratio, 0.4), 0.6)
+      // v1 只保存上下分屏比例；升级时默认保留原有视觉方向，不要求用户迁移或重建 Session。
+      if (parsed.version === 1) return { ratio, orientation: 'top-bottom' }
+      if (parsed.version === 2 && (parsed.orientation === 'top-bottom' || parsed.orientation === 'left-right')) return { ratio, orientation: parsed.orientation }
+      return { ratio: 0.5, orientation: 'top-bottom' }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0.5
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ratio: 0.5, orientation: 'top-bottom' }
       throw error
     }
   }
 
-  async saveSplitViewRatio(sessionId: string, ratio: number): Promise<void> {
+  async saveSplitViewPreference(sessionId: string, preference: BrowserSplitViewPreference): Promise<void> {
     const path = this.splitViewPreferencePath(sessionId)
     const temporary = `${path}.tmp-${process.pid}-${Date.now().toString(36)}`
     const backup = `${path}.bak-${process.pid}-${Date.now().toString(36)}`
     await mkdir(join(path, '..'), { recursive: true })
-    // 布局偏好只保存稳定比例，不保存会随 BrowserContext 重建失效的 viewId、URL或控制权状态。
-    await writeFile(temporary, `${JSON.stringify({ version: 1, ratio }, null, 2)}\n`, 'utf8')
+    // 布局偏好只保存稳定比例与排列方向，不保存会随 BrowserContext 重建失效的 viewId、URL 或控制权状态。
+    await writeFile(temporary, `${JSON.stringify({ version: 2, ratio: preference.ratio, orientation: preference.orientation }, null, 2)}\n`, 'utf8')
     try {
       await rename(path, backup).catch(error => {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error

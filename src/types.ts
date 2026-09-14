@@ -1,15 +1,23 @@
 import type { Browser, BrowserContext, CDPSession, Dialog, ElementHandle, Page } from 'playwright-core'
-import type { JsonValue } from '@deepseek-ai/dsh-session'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { ArtifactReference } from './artifact-store.ts'
-import type { BrowserCallFrame, BrowserDiagnosticPanelSnapshot, BrowserLiveViewMode, BrowserScriptSummary, BrowserSplitViewPane } from './protocol.ts'
+import type { BrowserCallFrame, BrowserDiagnosticPanelSnapshot, BrowserLiveViewMode, BrowserScriptSummary, BrowserSplitViewOrientation, BrowserSplitViewPane } from './protocol.ts'
 import type { BrowserExtensionRecord } from './persistent-profile.ts'
 import type { CdpContextAdapter } from './cdp-context-adapter.ts'
 
 export type ToolRegistrationMode = 'global' | 'session-select'
-export type BrowserControllerMode = 'other' | 'dsh-browser-tools'
+export type BrowserControllerMode = 'unselected' | 'other' | 'dsh-browser-tools'
+export type BrowserProxyMode = 'system' | 'direct' | 'custom'
+
+export interface BrowserProxyConfig {
+  mode?: BrowserProxyMode
+  server?: string
+  bypass?: string
+  username?: string
+  password?: string
+}
 
 export interface SessionControllerConfig {
-  defaultMode?: BrowserControllerMode
   conflictingToolPatterns?: string[]
   excludeTools?: string[]
   includeTools?: string[]
@@ -18,6 +26,7 @@ export interface SessionControllerConfig {
 export interface Config {
   executablePath?: string
   headless?: boolean
+  proxy?: BrowserProxyConfig
   allowedOrigins?: string[]
   allowLoopback?: boolean
   allowPrivateNetwork?: boolean
@@ -40,6 +49,13 @@ export interface Config {
 export interface ResolvedConfig {
   executablePath?: string
   headless: boolean
+  proxy: {
+    mode: BrowserProxyMode
+    server?: string
+    bypass?: string
+    username?: string
+    password?: string
+  }
   allowedOrigins: ReadonlySet<string>
   allowLoopback: boolean
   allowPrivateNetwork: boolean
@@ -57,7 +73,6 @@ export interface ResolvedConfig {
   sharedProfileSeedSessionId?: string
   toolRegistrationMode: ToolRegistrationMode
   sessionController: {
-    defaultMode: BrowserControllerMode
     conflictingToolPatterns: string[]
     excludeTools: string[]
     includeTools: string[]
@@ -203,6 +218,7 @@ export interface SessionState {
     topViewId?: string
     bottomViewId?: string
     focusedPane: BrowserSplitViewPane
+    orientation: BrowserSplitViewOrientation
     ratio: number
     changedAt: number
     panes: Record<BrowserSplitViewPane, { adaptiveWidth?: number; adaptiveHeight?: number }>

@@ -6,11 +6,10 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
-export type BrowserControllerMode = 'other' | 'dsh-browser-tools'
-export type BrowserControllerStatus = 'inactive' | 'activating' | 'active' | 'deactivating' | 'error'
+export type BrowserControllerMode = 'unselected' | 'other' | 'dsh-browser-tools'
+export type BrowserControllerStatus = 'inactive' | 'activating' | 'active' | 'releasing' | 'error'
 
 export interface BrowserControllerConfig {
-  defaultMode: BrowserControllerMode
   conflictingToolPatterns: string[]
   includeTools: string[]
   excludeTools: string[]
@@ -23,6 +22,7 @@ export interface BrowserControllerSnapshot {
   conflictingTools: string[]
   shadowedTools: string[]
   restrictedTools: string[]
+  selectionLocked: boolean
   canSwitchNow: boolean
   blockers: string[]
   error?: string
@@ -49,10 +49,20 @@ interface SessionControllerState {
 }
 
 interface PersistedControllerState {
-  schemaVersion: 1
+  schemaVersion: 2
   mode: BrowserControllerMode
   generation: number
   updatedAt: number
+  // 仅供读取阶段标记旧记录；写回磁盘时始终生成纯 schema v2 数据。
+  needsMigration?: boolean
+}
+
+interface PersistedControllerStateInput {
+  // JSON 文件属于外部输入，先使用宽类型读取，再由 readPersisted() 逐项验证并收窄。
+  schemaVersion?: unknown
+  mode?: unknown
+  generation?: unknown
+  updatedAt?: unknown
 }
 
 export interface BrowserControllerStoreOptions {
@@ -61,7 +71,6 @@ export interface BrowserControllerStoreOptions {
   config: BrowserControllerConfig
   toolDefinitions: readonly ToolDefinition[]
   registerTools(agent: Agent, definitions: readonly ToolDefinition[]): () => void
-  suspendRuntime(sessionId: string): Promise<void>
   releaseRuntime(sessionId: string, sessionCreatedAt: number): Promise<void>
   isOwnedTool(name: string): boolean
 }
@@ -73,9 +82,12 @@ function controllerFileName(sessionId: string): string {
 
 function controllerNotice(mode: BrowserControllerMode): string {
   if (mode === 'dsh-browser-tools') {
-    return '当前 Session 已启用 DSH BrowserScope。其他浏览器控制工具已从本 Session 的模型工具面隐藏。此前由其他插件生成的 ref、标签和页面状态不可继续使用，请从 browser_tabs/browser_snapshot 重新建立状态。'
+    return '当前 Session 已选择 DSH BrowserScope，并且不能在本 Session 中改用其他浏览器插件。其他浏览器工具已从本 Session 的模型工具面隐藏。需要使用其他浏览器插件时，请新建 Session。'
   }
-  return '当前 Session 已退出 DSH BrowserScope。不要继续使用此前的 viewId、ref、Checkpoint、Debug Session 或 Recorder 状态；其他浏览器工具将在后续 Agent Step 中按其插件配置可用。'
+  if (mode === 'other') {
+    return '当前 Session 已选择其他浏览器工具，并且不能在本 Session 中改用 DSH BrowserScope。需要使用 BrowserScope 时，请新建 Session。'
+  }
+  return '当前 Session 尚未选择浏览器工具。请先在浏览器菜单中选择 DSH BrowserScope 或其他浏览器工具。'
 }
 
 export class BrowserControllerStore {
@@ -99,7 +111,7 @@ export class BrowserControllerStore {
     if (state === undefined) {
       state = {
         sessionId,
-        mode: this.options.config.defaultMode,
+        mode: 'unselected',
         status: 'inactive',
         generation: 0,
         conflictingTools: [],
@@ -115,20 +127,27 @@ export class BrowserControllerStore {
 
   private async readPersisted(sessionId: string): Promise<PersistedControllerState | null | undefined> {
     try {
-      const value = JSON.parse(await readFile(this.storagePath(sessionId), 'utf8')) as Partial<PersistedControllerState>
-      if (value.schemaVersion !== 1
-        || (value.mode !== 'other' && value.mode !== 'dsh-browser-tools')
-        || !Number.isSafeInteger(value.generation)
-        || Number(value.generation) < 0) return null
-      return {
-        schemaVersion: 1,
-        mode: value.mode,
-        generation: Number(value.generation),
-        updatedAt: typeof value.updatedAt === 'number' && Number.isFinite(value.updatedAt) ? value.updatedAt : 0,
+      const value = JSON.parse(await readFile(this.storagePath(sessionId), 'utf8')) as PersistedControllerStateInput
+      if (!Number.isSafeInteger(value.generation) || Number(value.generation) < 0) return null
+      const generation = Number(value.generation)
+      const updatedAt = typeof value.updatedAt === 'number' && Number.isFinite(value.updatedAt) ? value.updatedAt : 0
+      if (value.schemaVersion === 2 && (value.mode === 'unselected' || value.mode === 'other' || value.mode === 'dsh-browser-tools')) {
+        return { schemaVersion: 2, mode: value.mode, generation, updatedAt }
       }
+      if (value.schemaVersion === 1 && (value.mode === 'other' || value.mode === 'dsh-browser-tools')) {
+        // 旧 other 只表示当时没有启用 BrowserScope，不能证明用户已经永久选择其他插件；
+        // 因此迁移为尚未选择。旧 BrowserScope 激活状态则继续锁定 BrowserScope。
+        return {
+          schemaVersion: 2,
+          mode: value.mode === 'dsh-browser-tools' ? 'dsh-browser-tools' : 'unselected',
+          generation,
+          updatedAt,
+          needsMigration: true,
+        }
+      }
+      return null
     } catch (error) {
-      // 文件尚不存在表示 Session 首次使用，应采用配置的 defaultMode；损坏、权限或其他读取错误
-      // 必须以 null 显式失败关闭到 other，不能因 defaultMode 为本插件而意外抢占第三方工具面。
+      // 文件不存在表示这是第一次选择；损坏或不可读时保持尚未选择，禁止自动启用任何浏览器工具。
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
       return null
     }
@@ -139,7 +158,7 @@ export class BrowserControllerStore {
     const target = this.storagePath(state.sessionId)
     const temporary = `${target}.${randomUUID()}.tmp`
     const value: PersistedControllerState = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       mode: state.mode,
       generation: state.generation,
       updatedAt: Date.now(),
@@ -162,6 +181,33 @@ export class BrowserControllerStore {
       conflictingTools: [...new Set(conflictingTools)].sort(),
       shadowedTools: [...new Set(shadowedTools)].sort(),
       restrictedTools: [...new Set(restrictedTools)].sort(),
+    }
+  }
+
+  private applySelectionGate(state: SessionControllerState, agent: Agent): void {
+    // 尚未选择浏览器插件时，当前 Agent Scope 暂时隐藏所有识别到的浏览器工具。
+    // 用户完成首次选择后会立即撤销这层限制，再建立所选工具面；第三方插件本身不被修改。
+    this.cleanupScopedEffects(state, agent)
+    const conflicts = this.classifyConflicts(agent)
+    state.conflictingTools = conflicts.conflictingTools
+    state.shadowedTools = []
+    state.restrictedTools = conflicts.conflictingTools
+    if (state.restrictedTools.length > 0) {
+      state.restrictionDisposer = agent.ctx.tools.restrict({ deny: state.restrictedTools })
+    }
+  }
+
+  private refreshBrowserScopeRestrictions(state: SessionControllerState, agent: Agent): void {
+    // 第三方浏览器插件可能在当前 Session 已锁定 BrowserScope 后热加载。
+    // 这里只重建当前 Agent Scope 的限制，不注销 BrowserScope 工具，也不修改第三方插件本身。
+    try { state.restrictionDisposer?.() } catch {}
+    state.restrictionDisposer = undefined
+    const conflicts = this.classifyConflicts(agent)
+    state.conflictingTools = conflicts.conflictingTools
+    state.shadowedTools = conflicts.shadowedTools
+    state.restrictedTools = conflicts.restrictedTools
+    if (state.restrictedTools.length > 0) {
+      state.restrictionDisposer = agent.ctx.tools.restrict({ deny: state.restrictedTools })
     }
   }
 
@@ -193,7 +239,7 @@ export class BrowserControllerStore {
           kind: 'plugin',
           plugin: 'dsh-browser-scope',
           form: 'notice',
-          summary: mode === 'dsh-browser-tools' ? '启用 DSH BrowserScope' : '退出 DSH BrowserScope',
+          summary: mode === 'dsh-browser-tools' ? '已选择 DSH BrowserScope' : mode === 'other' ? '已选择其他浏览器工具' : '尚未选择浏览器工具',
         },
       }))
     } catch {}
@@ -225,25 +271,53 @@ export class BrowserControllerStore {
     state.restore = priorQueue.catch(() => {}).then(() => this.readPersisted(sessionId)).then(async persisted => {
       if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) return
       if (persisted === null) {
-        state.mode = 'other'
+        state.mode = 'unselected'
         state.status = 'inactive'
-        state.error = '浏览器控制器持久状态损坏或不可读，已安全回退到 other。'
+        state.error = '浏览器选择记录损坏或不可读。当前 Session 需要重新选择浏览器工具。'
+        this.applySelectionGate(state, agent)
         return
       }
       state.generation = persisted?.generation ?? state.generation
-      state.mode = persisted?.mode ?? this.options.config.defaultMode
-      if (state.mode === 'dsh-browser-tools') await this.activateInternal(state, agent, false, true, bindingGeneration)
+      state.mode = persisted?.mode ?? 'unselected'
+      // 只有损坏记录或本次恢复失败才保留错误；有效记录和首次创建应清除旧 Agent Scope 遗留的错误投影。
+      state.error = undefined
+      if (persisted?.needsMigration === true) {
+        // 迁移结果先写成 schema v2，再建立对应工具面；下次启动不应重复解释旧语义。
+        await this.persist(state)
+        if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) return
+      }
+      if (state.mode === 'dsh-browser-tools') {
+        await this.activateInternal(state, agent, false, true, bindingGeneration)
+      } else if (state.mode === 'unselected') {
+        this.applySelectionGate(state, agent)
+      } else {
+        // 已永久选择其他浏览器工具时不施加任何限制，BrowserScope 保持退出。
+        this.cleanupScopedEffects(state, agent)
+        state.status = 'inactive'
+      }
     }).catch(error => {
       if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) return
-      state.mode = 'other'
+      const browserScopeLocked = state.mode === 'dsh-browser-tools'
+      this.cleanupScopedEffects(state, agent)
+      // 恢复异常不能暴露任意浏览器工具；已有 BrowserScope 选择继续锁定，其他情况回到尚未选择。
+      state.mode = browserScopeLocked ? 'dsh-browser-tools' : 'unselected'
       state.status = 'error'
       state.error = error instanceof Error ? error.message : String(error)
+      this.applySelectionGate(state, agent)
     })
 
-    // 恢复中的 Session 在首次模型 Step 组装前等待 scoped 工具面完成，保证模型可见 Schema
-    // 与持久模式一致；新建且默认 other 的 Session 只等待一次轻量文件读取。
+    // 每个模型 Step 前都确认当前 Session 的选择已经恢复，并吸收后加载的浏览器工具。
+    // 尚未选择时继续阻止任何浏览器工具抢先执行；已选 BrowserScope 时继续隐藏第三方浏览器工具。
     state.preStepDisposer = agent.ctx.on('agent/pre-step', async (_payload, next) => {
       await state.restore
+      if (state.agent === agent && state.bindingGeneration === bindingGeneration) {
+        if (state.mode === 'unselected') this.applySelectionGate(state, agent)
+        else if (state.mode === 'dsh-browser-tools' && state.status === 'active') this.refreshBrowserScopeRestrictions(state, agent)
+        else if (state.mode === 'dsh-browser-tools' && state.status === 'error') {
+          // 已锁定 BrowserScope 但恢复失败时仍要吸收后加载的第三方浏览器工具，禁止错误状态形成绕过窗口。
+          this.applySelectionGate(state, agent)
+        }
+      }
       return next()
     })
   }
@@ -297,7 +371,7 @@ export class BrowserControllerStore {
   snapshot(sessionId: string): BrowserControllerSnapshot {
     const state = this.state(sessionId)
     const blockers = state.agent?.status === 'running' ? ['agent-running'] : []
-    if (state.status === 'activating' || state.status === 'deactivating') blockers.push('controller-transition')
+    if (state.status === 'activating' || state.status === 'releasing') blockers.push('controller-transition')
     return {
       mode: state.mode,
       status: state.status,
@@ -305,7 +379,8 @@ export class BrowserControllerStore {
       conflictingTools: [...state.conflictingTools],
       shadowedTools: [...state.shadowedTools],
       restrictedTools: [...state.restrictedTools],
-      canSwitchNow: blockers.length === 0,
+      selectionLocked: state.mode !== 'unselected',
+      canSwitchNow: state.mode === 'unselected' && blockers.length === 0,
       blockers,
       ...(state.error === undefined ? {} : { error: state.error }),
     }
@@ -316,13 +391,14 @@ export class BrowserControllerStore {
     await state.restore
     const agent = state.agent
     const bindingGeneration = state.bindingGeneration
-    if (agent === undefined) throw new Error('当前 Session 没有可用 Agent，无法切换浏览器控制器。')
+    if (agent === undefined) throw new Error('当前 Session 没有可用 Agent，无法选择浏览器工具。')
     await this.queue(state, async () => {
-      if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试控制器切换。')
+      if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试浏览器选择。')
+      if (state.mode !== 'unselected') throw new Error('当前 Session 已经选择浏览器工具。需要改用其他浏览器插件时，请新建 Session。')
       await agent.whenIdle()
-      if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试控制器切换。')
+      if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试浏览器选择。')
       await agent.runMaintenance(async () => {
-        if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试控制器切换。')
+        if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试浏览器选择。')
         await this.activateInternal(state, agent, true, false, bindingGeneration)
       })
     })
@@ -332,9 +408,13 @@ export class BrowserControllerStore {
   private async activateInternal(state: SessionControllerState, agent: Agent, notify: boolean, restoring = false, expectedBinding = state.bindingGeneration): Promise<void> {
     if (state.agent !== agent || state.bindingGeneration !== expectedBinding) throw new Error('当前 Session 的 Agent Scope 已更新，旧 Scope 不得注册浏览器工具。')
     if (state.status === 'active') return
-    if (state.status === 'activating' || state.status === 'deactivating') throw new Error('浏览器控制器正在切换，请等待当前操作完成。')
+    if (!restoring && state.mode !== 'unselected') throw new Error('当前 Session 已经选择浏览器工具。需要改用其他浏览器插件时，请新建 Session。')
+    if (state.status === 'activating' || state.status === 'releasing') throw new Error('浏览器选择正在处理，请等待当前操作完成。')
     state.status = 'activating'
     state.error = undefined
+    const previousGeneration = state.generation
+    // 撤销“尚未选择”阶段的临时限制，再基于完整第三方工具面计算接管范围。
+    this.cleanupScopedEffects(state, agent)
     const conflicts = this.classifyConflicts(agent)
     state.conflictingTools = conflicts.conflictingTools
     state.shadowedTools = conflicts.shadowedTools
@@ -347,7 +427,7 @@ export class BrowserControllerStore {
         state.restrictionDisposer = agent.ctx.tools.restrict({ deny: state.restrictedTools })
       }
       state.guardDisposer = agent.ctx.tools.guard(exec => {
-        if (state.status === 'deactivating' && this.options.isOwnedTool(exec.name)) return 'DSH BrowserScope 正在退出，新的浏览器工具调用已拒绝。'
+        if (state.status === 'releasing' && this.options.isOwnedTool(exec.name)) return 'DSH BrowserScope 正在释放浏览器资源，新的浏览器工具调用已拒绝。'
         return undefined
       })
       state.mode = 'dsh-browser-tools'
@@ -362,45 +442,96 @@ export class BrowserControllerStore {
     } catch (error) {
       if (state.agent !== agent || state.bindingGeneration !== expectedBinding) throw error
       this.cleanupScopedEffects(state, agent)
-      state.mode = 'other'
+      state.generation = previousGeneration
       state.status = 'error'
       state.error = error instanceof Error ? error.message : String(error)
+      if (restoring) {
+        // 磁盘记录已经锁定 BrowserScope；恢复失败不能把 Session 降级成可改选状态。
+        // 保留锁定模式并隐藏第三方浏览器工具，等待插件重新加载或环境修复后再次恢复。
+        state.mode = 'dsh-browser-tools'
+        this.applySelectionGate(state, agent)
+      } else {
+        // 首次选择尚未成功提交，允许用户修复问题后重新选择。
+        state.mode = 'unselected'
+        this.applySelectionGate(state, agent)
+      }
       throw error
     }
   }
 
-  async deactivate(sessionId: string, release = false): Promise<BrowserControllerSnapshot> {
+  async selectOther(sessionId: string): Promise<BrowserControllerSnapshot> {
     const state = this.state(sessionId)
     await state.restore
     const agent = state.agent
     const bindingGeneration = state.bindingGeneration
-    if (agent === undefined) throw new Error('当前 Session 没有可用 Agent，无法切换浏览器控制器。')
+    if (agent === undefined) throw new Error('当前 Session 没有可用 Agent，无法选择浏览器工具。')
     await this.queue(state, async () => {
-      if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试控制器切换。')
+      if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试浏览器选择。')
+      if (state.mode !== 'unselected') throw new Error('当前 Session 已经选择浏览器工具。需要改用其他浏览器插件时，请新建 Session。')
       await agent.whenIdle()
-      if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试控制器切换。')
+      if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试浏览器选择。')
       await agent.runMaintenance(async () => {
-        if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试控制器切换。')
-        if (state.status !== 'active') return
-        state.status = 'deactivating'
+        if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试浏览器选择。')
+        this.cleanupScopedEffects(state, agent)
+        const conflicts = this.classifyConflicts(agent)
+        if (conflicts.conflictingTools.length === 0) {
+          // “其他浏览器工具”必须对应当前 Profile 中真实存在的第三方工具；没有可选工具时恢复选择门并拒绝锁定。
+          this.applySelectionGate(state, agent)
+          throw new Error('当前 Profile 没有检测到其他浏览器工具，不能选择此项。')
+        }
+        const previousGeneration = state.generation
+        state.mode = 'other'
+        state.status = 'inactive'
         state.error = undefined
+        state.generation += 1
+        state.conflictingTools = conflicts.conflictingTools
+        state.shadowedTools = []
+        state.restrictedTools = []
         try {
-          if (release) await this.options.releaseRuntime(sessionId, agent.session.header.createdAt)
-          else await this.options.suspendRuntime(sessionId)
-          if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，旧 Scope 不得完成控制器退出。')
-          this.cleanupScopedEffects(state, agent)
-          state.mode = 'other'
-          state.status = 'inactive'
-          state.activatedAt = undefined
-          state.generation += 1
-          state.conflictingTools = []
-          state.shadowedTools = []
-          state.restrictedTools = []
           await this.persist(state)
           await this.notify(agent, state.mode)
         } catch (error) {
-          // 安全收敛失败时，只有仍持有当前绑定的 Agent 才能恢复 active；旧 Agent 已被替换时
-          // 不得覆盖新 Scope 的恢复结果或所有权。
+          state.generation = previousGeneration
+          state.mode = 'unselected'
+          state.status = 'error'
+          state.error = error instanceof Error ? error.message : String(error)
+          this.applySelectionGate(state, agent)
+          throw error
+        }
+      })
+    })
+    return this.snapshot(sessionId)
+  }
+
+  async release(sessionId: string): Promise<BrowserControllerSnapshot> {
+    const state = this.state(sessionId)
+    await state.restore
+    const agent = state.agent
+    const bindingGeneration = state.bindingGeneration
+    if (agent === undefined) throw new Error('当前 Session 没有可用 Agent，无法释放浏览器资源。')
+    await this.queue(state, async () => {
+      if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试资源释放。')
+      if (state.mode !== 'dsh-browser-tools' || state.status !== 'active') throw new Error('当前 Session 没有正在使用的 BrowserScope 资源。')
+      await agent.whenIdle()
+      if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试资源释放。')
+      await agent.runMaintenance(async () => {
+        if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，请在新 Scope 上重试资源释放。')
+        state.status = 'releasing'
+        state.error = undefined
+        try {
+          await this.options.releaseRuntime(sessionId, agent.session.header.createdAt)
+          if (state.agent !== agent || state.bindingGeneration !== bindingGeneration) throw new Error('当前 Session 的 Agent Scope 已更新，旧 Scope 不得完成资源释放。')
+          // 只释放 BrowserScope 自己的页面和浏览器资源。工具选择、同名遮蔽和第三方限制继续保留，
+          // 这样同一个 Session 之后仍只能使用 BrowserScope，不会混入另一套浏览器状态。
+          state.status = 'active'
+          state.activatedAt = undefined
+          try {
+            agent.inject(createUserMessage({
+              content: [{ type: 'text', text: '当前 Session 的 BrowserScope 浏览器资源已释放。浏览器工具选择仍保持锁定；后续再次调用 BrowserScope 工具时会创建新的 BrowserScope 页面。需要使用其他浏览器插件时，请新建 Session。' }],
+              source: { kind: 'plugin', plugin: 'dsh-browser-scope', form: 'notice', summary: '已释放 BrowserScope 浏览器资源' },
+            }))
+          } catch {}
+        } catch (error) {
           if (state.agent === agent && state.bindingGeneration === bindingGeneration) {
             state.status = 'active'
             state.error = error instanceof Error ? error.message : String(error)

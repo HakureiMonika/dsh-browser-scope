@@ -1,12 +1,46 @@
 import { isIP } from 'node:net'
 import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
-import type { Config, ResolvedConfig } from './types.ts'
+import type { BrowserProxyConfig, Config, ResolvedConfig } from './types.ts'
 import { fail } from './errors.ts'
 
 const DEFAULT_UPLOAD_BYTES = 25 * 1024 * 1024
 const DEFAULT_DOWNLOAD_BYTES = 100 * 1024 * 1024
 const DEFAULT_ARTIFACT_BYTES = 256 * 1024 * 1024
+
+function resolveBrowserProxy(config?: BrowserProxyConfig): ResolvedConfig['proxy'] {
+  const mode = config?.mode ?? 'system'
+  const server = config?.server?.trim()
+  const bypass = config?.bypass?.trim()
+  const username = config?.username?.trim()
+  const password = config?.password
+
+  if (mode !== 'custom') {
+    // system 交由 Chromium 读取操作系统代理，direct 由启动参数明确禁用代理；
+    // 两种模式都不能悄悄忽略自定义字段，否则排障时会误判实际出口。
+    if (server || bypass || username || password) fail('POLICY_DENIED', `proxy ${mode} mode does not accept custom proxy fields`)
+    return { mode }
+  }
+
+  if (!server) fail('POLICY_DENIED', 'custom proxy mode requires proxy.server')
+  let url: URL
+  try {
+    url = new URL(server)
+  } catch (error) {
+    fail('POLICY_DENIED', 'custom proxy server is invalid', error)
+  }
+  if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(url.protocol)) fail('POLICY_DENIED', `custom proxy protocol ${url.protocol} is not supported`)
+  if (url.username !== '' || url.password !== '') fail('POLICY_DENIED', 'proxy credentials must use separate username and password fields')
+  if (url.pathname !== '/' || url.search !== '' || url.hash !== '') fail('POLICY_DENIED', 'custom proxy server must not include a path, query, or fragment')
+
+  return {
+    mode,
+    server: url.href.replace(/\/$/, ''),
+    ...(bypass ? { bypass } : {}),
+    ...(username ? { username } : {}),
+    ...(password ? { password } : {}),
+  }
+}
 
 export function resolveConfig(config: Config): ResolvedConfig {
   // 长期浏览器 Profile 必须锚定稳定的 DSH Home；启动工作目录可能随 Workspace 改变，不能作为持久化缓存根目录。
@@ -15,6 +49,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
   return {
     ...(config.executablePath === undefined ? {} : { executablePath: resolve(config.executablePath) }),
     headless: config.headless ?? true,
+    proxy: resolveBrowserProxy(config.proxy),
     allowedOrigins: new Set((config.allowedOrigins ?? []).map(value => new URL(value).origin)),
     // 完整 V2 按用户决策允许公网、本机与局域网导航；配置项仍可显式关闭对应范围。
     allowLoopback: config.allowLoopback ?? true,
@@ -30,9 +65,8 @@ export function resolveConfig(config: Config): ResolvedConfig {
     chromiumDownloadSource: config.chromiumDownloadSource ?? 'auto',
     chromiumDownloadTimeoutMs: config.chromiumDownloadTimeoutMs ?? 300000,
     subagentInteractive: config.subagentInteractive ?? false,
-    toolRegistrationMode: config.toolRegistrationMode ?? 'global',
+    toolRegistrationMode: config.toolRegistrationMode ?? 'session-select',
     sessionController: {
-      defaultMode: config.sessionController?.defaultMode ?? 'other',
       conflictingToolPatterns: config.sessionController?.conflictingToolPatterns ?? [
         '^browser_',
         '^chrome_',

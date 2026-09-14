@@ -1,8 +1,8 @@
 export type BrowserPanelView = 'live' | 'diagnostic' | 'console' | 'network' | 'debugger' | 'performance' | 'provider' | 'extensions' | 'emulation'
 
 export type BrowserToolRegistrationMode = 'global' | 'session-select'
-export type BrowserControllerMode = 'other' | 'dsh-browser-tools'
-export type BrowserControllerStatus = 'inactive' | 'activating' | 'active' | 'deactivating' | 'error'
+export type BrowserControllerMode = 'unselected' | 'other' | 'dsh-browser-tools'
+export type BrowserControllerStatus = 'inactive' | 'activating' | 'active' | 'releasing' | 'error'
 
 export interface BrowserControllerSnapshot {
   registrationMode: BrowserToolRegistrationMode
@@ -12,6 +12,7 @@ export interface BrowserControllerSnapshot {
   conflictingTools: string[]
   shadowedTools: string[]
   restrictedTools: string[]
+  selectionLocked: boolean
   canSwitchNow: boolean
   blockers: string[]
   error?: string
@@ -28,7 +29,8 @@ export type BrowserTakeoverAction = 'status' | 'request' | 'return' | 'cancel'
 export type BrowserLiveViewMode = 'standard' | 'adaptive'
 export type BrowserLiveViewAction = 'status' | 'standard' | 'adaptive' | 'initialize' | 'resize'
 export type BrowserSplitViewPane = 'top' | 'bottom'
-export type BrowserSplitViewAction = 'status' | 'open' | 'close' | 'swap' | 'assign' | 'focus' | 'ratio' | 'resize'
+export type BrowserSplitViewOrientation = 'top-bottom' | 'left-right'
+export type BrowserSplitViewAction = 'status' | 'open' | 'close' | 'swap' | 'assign' | 'focus' | 'ratio' | 'orientation' | 'resize'
 export type BrowserPanelTabAction = 'new' | 'select' | 'close' | 'back' | 'forward' | 'reload' | 'navigate'
 export type BrowserDiagnoseAction = 'start' | 'status' | 'inspect' | 'checkpoint' | 'compare' | 'report' | 'stop' | 'recorder_status' | 'recorder_start' | 'recorder_pause' | 'recorder_resume' | 'recorder_clear' | 'recorder_stop' | 'recorder_mark' | 'recorder_complete' | 'recorder_timeline'
 export type BrowserRecorderAction = 'status' | 'start' | 'pause' | 'resume' | 'clear' | 'stop' | 'mark' | 'complete'
@@ -151,7 +153,7 @@ export interface BrowserLivePaneSnapshot {
   pane: BrowserSplitViewPane
   viewId: string
   focused: boolean
-  liveView: { mode: BrowserLiveViewMode; width: number; height: number; viewportGeneration: number; reflowed: boolean; contentWidth: number; fittedWidth: number; reflowedElements: number; changedAt: number }
+  liveView: { mode: BrowserLiveViewMode; initialized: boolean; width: number; height: number; viewportGeneration: number; reflowed: boolean; contentWidth: number; fittedWidth: number; reflowedElements: number; changedAt: number }
   frame?: { streamGeneration: number; sequence: number; mediaType: 'image/jpeg'; data: string; width: number; height: number; viewportGeneration: number }
 }
 
@@ -286,6 +288,7 @@ export interface BrowserDiagnosticPanelSnapshot {
 export interface BrowserSplitViewState {
   enabled: boolean
   focusedPane: BrowserSplitViewPane
+  orientation: BrowserSplitViewOrientation
   ratio: number
   changedAt: number
   topViewId?: string
@@ -310,7 +313,7 @@ export interface BrowserPanelSnapshot {
   control?: { owner: 'model' | 'user'; pending: boolean; changedAt: number }
   diagnostic?: BrowserDiagnosticPanelSnapshot
   splitView?: BrowserSplitViewState
-  liveView?: { mode: BrowserLiveViewMode; width: number; height: number; viewportGeneration: number; reflowed: boolean; contentWidth: number; fittedWidth: number; reflowedElements: number; changedAt: number }
+  liveView?: { mode: BrowserLiveViewMode; initialized: boolean; width: number; height: number; viewportGeneration: number; reflowed: boolean; contentWidth: number; fittedWidth: number; reflowedElements: number; changedAt: number }
   frame?: { streamGeneration: number; sequence: number; mediaType: 'image/jpeg'; data: string; width: number; height: number; viewportGeneration: number }
   message?: string
 }
@@ -334,6 +337,7 @@ export interface BrowserLiveViewInput {
 export interface BrowserSplitViewInput {
   action: BrowserSplitViewAction
   pane?: BrowserSplitViewPane
+  orientation?: BrowserSplitViewOrientation
   viewId?: string
   ratio?: number
   width?: number

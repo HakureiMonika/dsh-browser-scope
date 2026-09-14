@@ -4,13 +4,16 @@ import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import type { BrowserControllerSnapshot, BrowserDebuggerInput, BrowserEmulateInput, BrowserExtensionInput, BrowserExtensionSummary, BrowserFrameCursor, BrowserInputTraceUpdate, BrowserLivePaneSnapshot, BrowserLiveViewInput, BrowserLiveViewMode, BrowserNetworkInput, BrowserPanelSnapshot, BrowserPanelTabInput, BrowserPanelView, BrowserProfileInput, BrowserProviderInput, BrowserRecorderInput, BrowserSplitViewInput, BrowserSplitViewPane, BrowserTakeoverInput, BrowserUserInput } from '../protocol.ts'
 import css from './panel.module.css'
 
-const CHANNEL = '/browser-tools'
+const CHANNEL = '/api'
+const RPC_METHOD = 'browser-tools'
+const BROWSER_TAB_ID = 'dsh-browser-scope/browser'
+const BROWSER_TAB_KIND = 'dsh-browser-scope.browser'
 const LIVE_VIEW_PREFERENCE_KEY = 'dsh-browser-tools.live-view-mode'
-const OUTER_BROWSER_RATIO_KEY = 'dsh-browser-tools.outer-browser-ratio'
-const nativeFrameLayouts = new WeakMap<HTMLElement, { template: string; priority: string; expandedSidebarWidth: number }>()
 const views: BrowserPanelView[] = ['live', 'diagnostic', 'console', 'network', 'debugger', 'performance', 'provider', 'extensions', 'emulation']
 const viewLabels: Record<BrowserPanelView, string> = {
   live: '实况',
@@ -34,6 +37,21 @@ const debuggerActions: Array<{ action: BrowserDebuggerInput['action']; label: st
   { action: 'detach', label: '断开' },
 ]
 
+interface CompatibleSidebarRightTab {
+  id: string
+  kind: string
+}
+
+interface CompatibleSidebarRight {
+  openTab(kind: string, options?: { params?: BrowserTabParams }): void
+  close(tabId: string): void
+  active(): CompatibleSidebarRightTab | undefined
+}
+
+interface CompatibleSidebarRightTabs {
+  register(definition: { id: string; kind: string; priority?: 'extension' | 'builtin' | 'fallback'; title(address: string): string }): () => void
+}
+
 interface CompatibleSlotRegistry {
   register(options: object, component: unknown): () => void
   inject(name: string, callback: () => (() => void) | Iterable<() => void>): () => void
@@ -41,10 +59,22 @@ interface CompatibleSlotRegistry {
 
 type BrowserClientContext = ClientContext & {
   connection: ConnectionHandle
+  sidebarRight: CompatibleSidebarRight
+  sidebarRightTabs: CompatibleSidebarRightTabs
   slots: CompatibleSlotRegistry
 }
 
-type SessionSlotProps<K extends 'conversation.input.right' | 'details'> = PropsRuntime<K> & { sessionId: string }
+type SessionSlotProps<K extends 'conversation.input.right' | 'sidebar.right.pane.tab'> = PropsRuntime<K> & { sessionId: string }
+
+interface BrowserTabParams {
+  view?: BrowserPanelView
+}
+
+declare module '@deepseek-ai/dsh-client-ui-sidebar-right/client' {
+  interface SidebarRightTabParamsMap {
+    'dsh-browser-scope.browser': BrowserTabParams
+  }
+}
 
 function valueOf<T>(value: unknown): T {
   const result = value as { ok?: boolean; value?: T; error?: { message?: string } }
@@ -66,202 +96,14 @@ function saveLiveViewPreference(mode: BrowserLiveViewMode): void {
   } catch {}
 }
 
-function outerBrowserRatio(): number {
-  try {
-    const value = Number(localStorage.getItem(OUTER_BROWSER_RATIO_KEY))
-    return Number.isFinite(value) ? Math.min(Math.max(value, 0.3), 0.7) : 0.5
-  } catch {
-    return 0.5
-  }
-}
-
-function saveOuterBrowserRatio(ratio: number): void {
-  try {
-    localStorage.setItem(OUTER_BROWSER_RATIO_KEY, String(ratio))
-  } catch {}
-}
-
-function frameElement(): HTMLElement | undefined {
-  const overlay = document.querySelector('[data-shell-overlay]')
-  const frame = overlay?.parentElement
-  if (!(frame instanceof HTMLElement)) return undefined
-  if (getComputedStyle(frame).display !== 'grid' || frame.children.length < 4) return undefined
-  return frame
-}
-
-function nativeSidebarWidth(template: string): number | undefined {
-  // 只识别DSH权威模板“像素侧栏 + 单一1fr中央列 + 像素详情列”；插件自己的双fr模板不会匹配，避免观察器读取到自身投影后形成循环。
-  const match = /^\s*(\d+(?:\.\d+)?)px\s+minmax\(\s*0(?:px)?\s*,\s*1fr\s*\)\s+\d+(?:\.\d+)?px\s*$/.exec(template)
-  if (match?.[1] === undefined) return undefined
-  const width = Number(match[1])
-  return Number.isFinite(width) ? width : undefined
-}
-
-function setSplit(onNarrow: () => void): { ok: true; dispose(): void } | { ok: false; message: string } {
-  const frame = frameElement()
-  if (frame === undefined) return { ok: false, message: '当前 DSH 页面结构不支持内嵌分屏。' }
-  if (frame.getBoundingClientRect().width < 800) return { ok: false, message: '当前窗口过窄，请将 DSH Web 窗口扩大到至少 800px。' }
-  let nativeLayout = nativeFrameLayouts.get(frame)
-  if (nativeLayout === undefined) {
-    const inlineTemplate = frame.style.gridTemplateColumns
-    const inlineNativeWidth = nativeSidebarWidth(inlineTemplate)
-    if (inlineNativeWidth === undefined && frame.dataset.browserSplitActive === 'true') {
-      // 热重载或异常卸载可能遗留旧插件双fr模板；先撤销该覆盖，再从DSH自身布局读取基线，禁止新实例继承污染模板。
-      frame.style.removeProperty('grid-template-columns')
-      delete frame.dataset.browserSplitActive
-    }
-    const sidebar = frame.children.item(0)
-    const renderedWidth = sidebar instanceof HTMLElement ? sidebar.getBoundingClientRect().width : 0
-    const contentWidth = sidebar instanceof HTMLElement ? sidebar.scrollWidth : 0
-    const computedWidth = Number.parseFloat(getComputedStyle(frame).gridTemplateColumns) || 0
-    nativeLayout = {
-      template: inlineNativeWidth === undefined ? frame.style.gridTemplateColumns : inlineTemplate,
-      priority: frame.style.getPropertyPriority('grid-template-columns'),
-      expandedSidebarWidth: Math.max(inlineNativeWidth ?? 0, renderedWidth, contentWidth, computedWidth, 56),
-    }
-    nativeFrameLayouts.set(frame, nativeLayout)
-  }
-  let sidebarWidth = frame.hasAttribute('data-sidebar-collapsed') ? 56 : nativeLayout.expandedSidebarWidth
-  let ratio = outerBrowserRatio()
-  let applying = false
-  let sidebarCollapsed = frame.hasAttribute('data-sidebar-collapsed')
-  let collapseProjectionTimer: ReturnType<typeof setTimeout> | undefined
-  const columns = () => `${sidebarWidth}px minmax(0, ${1 - ratio}fr) minmax(0, ${ratio}fr)`
-  const apply = () => {
-    if (applying || !frame.isConnected) return
-    applying = true
-    frame.dataset.browserSplitActive = 'true'
-    frame.style.setProperty('grid-template-columns', columns(), 'important')
-    const frameRect = frame.getBoundingClientRect()
-    const contentWidth = Math.max(frameRect.width - sidebarWidth, 1)
-    divider.style.left = `${frameRect.left + sidebarWidth + contentWidth * (1 - ratio)}px`
-    divider.style.top = `${frameRect.top}px`
-    divider.style.height = `${frameRect.height}px`
-    applying = false
-  }
-  const divider = document.createElement('div')
-  divider.className = css.outerDivider ?? ''
-  divider.setAttribute('role', 'separator')
-  divider.setAttribute('aria-label', '调整对话区与浏览器宽度')
-  divider.setAttribute('aria-orientation', 'vertical')
-  divider.setAttribute('aria-valuemin', '30')
-  divider.setAttribute('aria-valuemax', '70')
-  divider.setAttribute('aria-valuenow', String(Math.round(ratio * 100)))
-  divider.tabIndex = 0
-  const syncModalState = () => {
-    // DSH模态窗口和分界线都可能挂在根层叠上下文；模态存在时彻底移除分界线的视觉与命中，避免设置、目录选择或确认窗口被穿透点击。
-    const blocked = document.querySelector('[role="dialog"][aria-modal="true"]') !== null
-    divider.hidden = blocked
-    divider.tabIndex = blocked ? -1 : 0
-    divider.setAttribute('aria-hidden', String(blocked))
-    if (blocked && document.activeElement === divider) divider.blur()
-    if (!blocked) apply()
-  }
-  const beginResize = (event: PointerEvent) => {
-    divider.setPointerCapture(event.pointerId)
-    const move = (pointer: PointerEvent) => {
-      const rect = frame.getBoundingClientRect()
-      const contentWidth = Math.max(rect.width - sidebarWidth, 1)
-      ratio = Math.min(Math.max((rect.right - pointer.clientX) / contentWidth, 0.3), 0.7)
-      divider.setAttribute('aria-valuenow', String(Math.round(ratio * 100)))
-      apply()
-    }
-    const finish = (pointer: PointerEvent) => {
-      move(pointer)
-      window.removeEventListener('pointermove', move)
-      window.removeEventListener('pointerup', finish)
-      saveOuterBrowserRatio(ratio)
-    }
-    window.addEventListener('pointermove', move)
-    window.addEventListener('pointerup', finish, { once: true })
-  }
-  divider.addEventListener('pointerdown', beginResize)
-  const adjustByKey = (event: KeyboardEvent) => {
-    const previousRatio = ratio
-    if (event.key === 'ArrowLeft') ratio = Math.min(ratio + 0.02, 0.7)
-    else if (event.key === 'ArrowRight') ratio = Math.max(ratio - 0.02, 0.3)
-    else if (event.key === 'Home') ratio = 0.3
-    else if (event.key === 'End') ratio = 0.7
-    else return
-    event.preventDefault()
-    if (ratio === previousRatio) return
-    divider.setAttribute('aria-valuenow', String(Math.round(ratio * 100)))
-    apply()
-    saveOuterBrowserRatio(ratio)
-  }
-  divider.addEventListener('keydown', adjustByKey)
-  // DSH Grid由框架管理，未知子节点会在重新渲染时被清理；分界线挂到body并用fixed定位，避免干扰Slot子树。
-  document.body.append(divider)
-  apply()
-  syncModalState()
-  const mutation = new MutationObserver(() => {
-    // DSH折叠属性先于侧栏内部元素动画变化。展开时先释放空间；折叠时暂时保留旧宽度，让内部元素完成收起后再投影56px，避免出现“外框已折叠、内部元素仍停留在展开位置”的裁切状态。
-    const nativeWidth = nativeSidebarWidth(frame.style.gridTemplateColumns)
-    const collapsed = frame.hasAttribute('data-sidebar-collapsed')
-    const collapsedChanged = collapsed !== sidebarCollapsed
-    sidebarCollapsed = collapsed
-    if (collapsedChanged && collapseProjectionTimer !== undefined) {
-      clearTimeout(collapseProjectionTimer)
-      collapseProjectionTimer = undefined
-    }
-    if (collapsed) {
-      if (collapsedChanged) {
-        const sidebar = frame.children.item(0)
-        const renderedWidth = sidebar instanceof HTMLElement ? sidebar.getBoundingClientRect().width : sidebarWidth
-        sidebarWidth = Math.max(Math.round(renderedWidth), sidebarWidth, 56)
-        apply()
-        collapseProjectionTimer = setTimeout(() => {
-          collapseProjectionTimer = undefined
-          if (!frame.isConnected || !frame.hasAttribute('data-sidebar-collapsed')) return
-          sidebarWidth = 56
-          apply()
-        }, 240)
-      }
-    } else {
-      const sidebar = frame.children.item(0)
-      const renderedWidth = sidebar instanceof HTMLElement ? sidebar.getBoundingClientRect().width : 0
-      const contentWidth = sidebar instanceof HTMLElement ? sidebar.scrollWidth : 0
-      const expandedWidth = Math.max(nativeWidth ?? 0, renderedWidth, contentWidth, nativeLayout.expandedSidebarWidth, 56)
-      nativeLayout.expandedSidebarWidth = expandedWidth
-      sidebarWidth = expandedWidth
-    }
-    if (!collapsed || !collapsedChanged) {
-      if (frame.dataset.browserSplitActive === 'true' && (frame.style.gridTemplateColumns !== columns() || frame.style.getPropertyPriority('grid-template-columns') !== 'important')) apply()
-    }
-  })
-  const modalMutation = new MutationObserver(syncModalState)
-  const resize = new ResizeObserver(() => {
-    if (frame.getBoundingClientRect().width < 800) {
-      // 通过统一控制器关闭可同时停止轮询与 Screencast、撤销面板 Slot、恢复 Grid 并同步输入区按钮状态。
-      onNarrow()
-      return
-    }
-    apply()
-  })
-  mutation.observe(frame, { attributes: true, attributeFilter: ['style', 'data-details-collapsed', 'data-sidebar-collapsed'] })
-  modalMutation.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['role', 'aria-modal'] })
-  resize.observe(frame)
-  return {
-    ok: true,
-    dispose() {
-      if (collapseProjectionTimer !== undefined) clearTimeout(collapseProjectionTimer)
-      mutation.disconnect()
-      modalMutation.disconnect()
-      resize.disconnect()
-      divider.removeEventListener('pointerdown', beginResize)
-      divider.removeEventListener('keydown', adjustByKey)
-      divider.remove()
-      delete frame.dataset.browserSplitActive
-      if (nativeLayout.template === '') frame.style.removeProperty('grid-template-columns')
-      else frame.style.setProperty('grid-template-columns', nativeLayout.template, nativeLayout.priority)
-    },
-  }
+function isBrowserPanelView(value: unknown): value is BrowserPanelView {
+  return typeof value === 'string' && views.includes(value as BrowserPanelView)
 }
 
 interface Port {
   controllerStatus(sessionId: string): Promise<BrowserControllerSnapshot>
   controllerActivate(sessionId: string): Promise<BrowserControllerSnapshot>
-  controllerDeactivate(sessionId: string): Promise<BrowserControllerSnapshot>
+  controllerSelectOther(sessionId: string): Promise<BrowserControllerSnapshot>
   controllerRelease(sessionId: string): Promise<BrowserControllerSnapshot>
   snapshot(sessionId: string, view: BrowserPanelView, streamGeneration?: number, sequence?: number, splitCursors?: Partial<Record<BrowserSplitViewPane, BrowserFrameCursor>>, popupCursor?: BrowserFrameCursor, diagnosticReadSequence?: number): Promise<BrowserPanelSnapshot>
   tabs(sessionId: string, input: BrowserPanelTabInput): Promise<unknown>
@@ -288,11 +130,21 @@ type UntracedBrowserUserInput = BrowserUserInput extends infer Input
 
 interface PanelController {
   open(sessionId: string, view: BrowserPanelView): { ok: boolean; message?: string }
-  close(): void
-  subscribe(listener: (state: { open: boolean; sessionId?: string; view?: BrowserPanelView }) => void): () => void
+  // 指定 Session 时只关闭该会话的 BrowserScope；插件卸载时不传参数，统一关闭所有仍挂载的标签。
+  close(sessionId?: string): void
+  // 右侧栏标签可由 DSH 自带的标签栏关闭；组件挂载回报用于同步输入区按钮，避免仅依赖主动 open/close 导致状态失真。
+  attach(
+    sessionId: string,
+    tabId: string,
+    closeTab: () => void,
+    openTab: (view: BrowserPanelView) => void,
+  ): () => void
+  // 视图写入 DSH Tab 导航参数后，由实际渲染的组件回报最终值；Controller 因此只保存已生效状态，不复制右侧栏内部 Store。
+  update(sessionId: string, tabId: string, view: BrowserPanelView): void
+  subscribe(sessionId: string, listener: (state: { open: boolean; view?: BrowserPanelView }) => void): () => void
 }
 
-function BrowserControl({ sessionId, controller, port, useSessions }: SessionSlotProps<'conversation.input.right'> & { controller: PanelController; port: Port }) {
+function BrowserControl({ sessionId, controller, port, useSession }: SessionSlotProps<'conversation.input.right'> & { controller: PanelController; port: Port }) {
   const [menu, setMenu] = useState(false)
   const [open, setOpen] = useState(false)
   const [view, setView] = useState<BrowserPanelView>('live')
@@ -302,28 +154,34 @@ function BrowserControl({ sessionId, controller, port, useSessions }: SessionSlo
     snapshot: BrowserControllerSnapshot
   }>()
   const [confirmActivate, setConfirmActivate] = useState(false)
-  const [confirmDeactivate, setConfirmDeactivate] = useState(false)
-  // DSH 的空白 Hero Session 会在首条消息后切换为新的正式 Session ID，details Slot 也只接受正式 Session。
-  // 因此面板和 Controller 选择必须同时满足：输入区绑定的是当前 Session，且该 Session 已经 blank=false。
-  // 不能把空白 Session 的选择迁移到新 ID，否则会把一个 Session 的第三方工具仲裁错误投影到另一个 Session。
-  const currentSessionId = useSessions(state => state.current)
-  const currentSessionBlank = useSessions(state => state.current === undefined
-    ? undefined
-    : state.byId[state.current]?.blank)
-  const panelAvailable = currentSessionId === sessionId && currentSessionBlank === false
+  const [confirmOther, setConfirmOther] = useState(false)
+  const [confirmRelease, setConfirmRelease] = useState(false)
+  const [arbitratedToolsOpen, setArbitratedToolsOpen] = useState(false)
+  // Hero Session 在首条消息前仍是临时身份；只允许正式 Session 打开 BrowserScope。
+  const currentSessionBlank = useSession((state: { readonly blank: boolean }) => state.blank)
+  const panelAvailable = currentSessionBlank === false
   // Controller 快照必须携带其读取时的 Session ID。Hero→正式或普通 Session 切换发生时，
   // 即使 React effect 尚未执行，旧 active 快照也会在本次渲染立即失效，禁止打开错误身份的 BrowserPanel。
   const controllerState = controllerBinding?.sessionId === sessionId
     ? controllerBinding.snapshot
     : undefined
   const loadingController = controllerState === undefined
-  const switching = controllerState?.status === 'activating' || controllerState?.status === 'deactivating'
-  const active = controllerState?.registrationMode === 'global' || controllerState?.mode === 'dsh-browser-tools'
+  const switching = controllerState?.status === 'activating' || controllerState?.status === 'releasing'
+  const browserScopeSelected = controllerState?.registrationMode === 'global' || controllerState?.mode === 'dsh-browser-tools'
+  const active = controllerState?.registrationMode === 'global' || (controllerState?.mode === 'dsh-browser-tools' && controllerState.status === 'active')
+  const browserScopeUnavailable = browserScopeSelected && !active
+  const unselected = controllerState?.registrationMode === 'session-select' && controllerState.mode === 'unselected'
+  const selectedOther = controllerState?.registrationMode === 'session-select' && controllerState.mode === 'other'
+  const otherBrowserToolsAvailable = (controllerState?.conflictingTools.length ?? 0) > 0
   const controllerLabel = loadingController
-    ? '控制器状态读取中'
+    ? '浏览器选择读取中'
     : active
-      ? 'DSH BrowserScope'
-      : '其他浏览器工具'
+      ? 'DSH BrowserScope（已锁定）'
+      : browserScopeUnavailable
+        ? 'DSH BrowserScope（已锁定，暂不可用）'
+        : selectedOther
+          ? '其他浏览器工具（已锁定）'
+          : '尚未选择浏览器工具'
 
   const refreshController = async () => {
     try {
@@ -336,13 +194,13 @@ function BrowserControl({ sessionId, controller, port, useSessions }: SessionSlo
 
   useEffect(() => {
     let disposed = false
-    // Session 切换时立即清空旧状态并关闭旧分屏，避免把上一 Session 的 active/other、
-    // 确认框或 BrowserPanel 短暂投影到新会话；随后只接受携带当前 Session ID 的 RPC 结果。
+    // Session 切换时立即清空旧控制器投影。右侧栏状态由 DSH 按 Session 保存，不能因为输入区组件切换身份就关闭旧 Session 的标签。
     setControllerBinding(undefined)
     setConfirmActivate(false)
-    setConfirmDeactivate(false)
+    setConfirmOther(false)
+    setConfirmRelease(false)
+    setArbitratedToolsOpen(false)
     setMessage(undefined)
-    controller.close()
     const refresh = async () => {
       try {
         const snapshot = await port.controllerStatus(sessionId)
@@ -356,17 +214,17 @@ function BrowserControl({ sessionId, controller, port, useSessions }: SessionSlo
   }, [controller, port, sessionId])
 
   useEffect(() => {
-    // 分屏可能由输入区按钮或右侧面板关闭，统一订阅控制器的真实状态可避免两个入口显示不一致。
-    const unsubscribe = controller.subscribe(state => {
-      const current = state.open && state.sessionId === sessionId
-      setOpen(current)
-      if (current && state.view !== undefined) setView(state.view)
+    // 右侧栏标签可能由输入区按钮、面板内部按钮或 DSH 标签栏关闭；按 Session 订阅实际挂载状态，避免会话之间互相覆盖。
+    return controller.subscribe(sessionId, state => {
+      setOpen(state.open)
+      if (state.open && state.view !== undefined) setView(state.view)
     })
-    return () => {
-      unsubscribe()
-      controller.close()
-    }
   }, [controller, sessionId])
+
+  const closeMenu = () => {
+    setMenu(false)
+    setArbitratedToolsOpen(false)
+  }
 
   const activate = async () => {
     setConfirmActivate(false)
@@ -385,16 +243,31 @@ function BrowserControl({ sessionId, controller, port, useSessions }: SessionSlo
     }
   }
 
-  const deactivate = async (release: boolean) => {
-    setConfirmDeactivate(false)
+  const selectOther = async () => {
+    setConfirmOther(false)
     setMessage(undefined)
-    controller.close()
+    if (!panelAvailable) {
+      setMessage('当前会话尚未形成正式 Agent Session；请先发送首条消息，再为正式 Session 选择浏览器工具。')
+      return
+    }
     try {
-      const snapshot = release
-        ? await port.controllerRelease(sessionId)
-        : await port.controllerDeactivate(sessionId)
+      const snapshot = await port.controllerSelectOther(sessionId)
       setControllerBinding({ sessionId, snapshot })
-      setMenu(false)
+      closeMenu()
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : String(cause))
+      await refreshController()
+    }
+  }
+
+  const release = async () => {
+    setConfirmRelease(false)
+    setMessage(undefined)
+    controller.close(sessionId)
+    try {
+      const snapshot = await port.controllerRelease(sessionId)
+      setControllerBinding({ sessionId, snapshot })
+      closeMenu()
     } catch (cause) {
       setMessage(cause instanceof Error ? cause.message : String(cause))
       await refreshController()
@@ -415,14 +288,14 @@ function BrowserControl({ sessionId, controller, port, useSessions }: SessionSlo
       return
     }
     if (open) {
-      controller.close()
+      controller.close(sessionId)
       setOpen(false)
     } else {
       const result = controller.open(sessionId, view)
       setOpen(result.ok)
       setMessage(result.message)
     }
-    setMenu(false)
+    closeMenu()
   }
 
   const select = (next: BrowserPanelView) => {
@@ -445,12 +318,20 @@ function BrowserControl({ sessionId, controller, port, useSessions }: SessionSlo
     const result = controller.open(sessionId, next)
     setOpen(result.ok)
     setMessage(result.message)
-    setMenu(false)
+    closeMenu()
   }
 
   return (
     <span className={css.control}>
-      <button type="button" className={css.controlButton} aria-expanded={menu} onClick={() => setMenu(value => !value)}>浏览器</button>
+      <button
+        type="button"
+        className={css.controlButton}
+        aria-expanded={menu}
+        onClick={() => {
+          if (menu) closeMenu()
+          else setMenu(true)
+        }}
+      >浏览器</button>
       <span className={css.controllerBadge} data-active={!loadingController && active || undefined}>{controllerLabel}</span>
       {menu && <span className={css.menu}>
         <span className={css.controllerStatus}>当前 Session：{controllerLabel}</span>
@@ -458,48 +339,103 @@ function BrowserControl({ sessionId, controller, port, useSessions }: SessionSlo
           <span>尚未确认当前 Session 的浏览器控制器，完整浏览器面板不会在此期间启动。</span>
           <button type="button" onClick={() => { void refreshController() }}>重新读取控制器状态</button>
         </span>}
-        {!loadingController && !active && !confirmActivate && <>
-          {!panelAvailable && <span className={css.controllerStatus}>当前会话使用临时空白 Session；发送首条消息形成正式 Session 后，才可选择 DSH BrowserScope。</span>}
-          <button type="button" disabled={switching} onClick={() => { setMenu(false) }}>继续使用其他浏览器工具</button>
-          <button type="button" disabled={switching || !panelAvailable} onClick={() => { setConfirmActivate(true) }}>启用 DSH BrowserScope</button>
+        {unselected && !confirmActivate && !confirmOther && <>
+          {!panelAvailable && <span className={css.controllerStatus}>当前会话使用临时空白 Session；发送首条消息形成正式 Session 后，才可选择浏览器工具。</span>}
+          <span className={css.controllerStatus}>每个 Session 只能选择一套浏览器工具。选定后不能在本 Session 中更换，因为不同插件的页面、标签、元素引用和登录状态不能安全混用。</span>
+          {!otherBrowserToolsAvailable && <span className={css.controllerStatus}>当前 Profile 没有检测到其他浏览器工具，只能选择 DSH BrowserScope。</span>}
+          <button type="button" disabled={switching || !panelAvailable || !otherBrowserToolsAvailable} onClick={() => { setConfirmOther(true) }}>使用其他浏览器工具</button>
+          <button type="button" disabled={switching || !panelAvailable} onClick={() => { setConfirmActivate(true) }}>使用 DSH BrowserScope</button>
         </>}
-        {!active && confirmActivate && <span className={css.controllerConfirm}>
-          <strong>确认启用 DSH BrowserScope</strong>
-          <span>当前 Session 中检测到的其他浏览器控制工具将暂时从模型工具面隐藏；其他 Session、第三方插件及其浏览器状态不受影响。</span>
-          <span>第三方插件的标签、登录态、ref 和页面状态不会迁移。</span>
+        {selectedOther && <span className={css.controllerConfirm}>
+          <strong>当前 Session 已锁定其他浏览器工具</strong>
+          <span>BrowserScope 不会在本 Session 注册工具或创建浏览器资源。需要使用 BrowserScope 时，请新建 Session。</span>
+        </span>}
+        {browserScopeUnavailable && <span className={css.controllerConfirm}>
+          <strong>当前 Session 已锁定 BrowserScope，但本次恢复失败</strong>
+          <span>{controllerState?.error ?? 'BrowserScope 当前暂不可用。'}</span>
+          <span>为避免混用浏览器状态，本 Session 不会改为其他浏览器插件。请修复环境或重新加载 BrowserScope 后再试；需要使用其他插件时，请新建 Session。</span>
+          <button type="button" onClick={() => { void refreshController() }}>重新读取状态</button>
+        </span>}
+        {unselected && confirmOther && <span className={css.controllerConfirm}>
+          <strong>确认使用其他浏览器工具</strong>
+          <span>确认后，当前 Session 将永久使用现有的其他浏览器工具，不能再启用 BrowserScope。</span>
+          <span>这样可以避免不同插件的页面、标签、元素引用和登录状态在同一个 Session 中混用。</span>
           <span className={css.controllerActions}>
-            <button type="button" disabled={switching} onClick={() => { void activate() }}>确认启用</button>
+            <button type="button" disabled={switching} onClick={() => { void selectOther() }}>确认选择</button>
+            <button type="button" disabled={switching} onClick={() => setConfirmOther(false)}>取消</button>
+          </span>
+        </span>}
+        {unselected && confirmActivate && <span className={css.controllerConfirm}>
+          <strong>确认使用 DSH BrowserScope</strong>
+          <span>确认后，当前 Session 将永久使用 BrowserScope 的 30 个工具，其他浏览器工具会在本 Session 中隐藏。</span>
+          <span>需要使用其他浏览器插件时，请新建 Session。第三方插件本身及其他 Session 不受影响。</span>
+          <span className={css.controllerActions}>
+            <button type="button" disabled={switching} onClick={() => { void activate() }}>确认选择</button>
             <button type="button" disabled={switching} onClick={() => setConfirmActivate(false)}>取消</button>
           </span>
         </span>}
-        {active && !confirmDeactivate && <>
+        {active && !confirmRelease && <>
           {!panelAvailable && <span className={css.controllerStatus}>当前会话尚未形成正式 Agent Session；发送首条消息后可打开完整面板。</span>}
-          <button type="button" disabled={!panelAvailable} onClick={toggle}>{open ? '关闭右侧分屏' : '打开右侧分屏'}</button>
+          <span className={css.controllerStatus}>当前 Session 已锁定 BrowserScope。关闭标签或释放资源不会改变选择。</span>
+          <button type="button" disabled={!panelAvailable} onClick={toggle}>{open ? '关闭 BrowserScope 标签' : '打开 BrowserScope 标签'}</button>
           {views.map(item => <button type="button" key={item} disabled={!panelAvailable} data-selected={view === item || undefined} onClick={() => select(item)}>{viewLabels[item]}</button>)}
-          {controllerState?.registrationMode === 'session-select' && <button type="button" disabled={switching} onClick={() => setConfirmDeactivate(true)}>退出 DSH BrowserScope</button>}
+          {controllerState?.registrationMode === 'session-select' && <button type="button" disabled={switching} onClick={() => setConfirmRelease(true)}>释放 BrowserScope 资源</button>}
         </>}
-        {active && confirmDeactivate && <span className={css.controllerConfirm}>
-          <strong>确认退出 DSH BrowserScope</strong>
-          <span>退出会安全收敛 Debugger、Network、Profile、Recorder、Takeover 与旧引用；其他浏览器工具从后续 Agent Step 起恢复。</span>
+        {active && confirmRelease && <span className={css.controllerConfirm}>
+          <strong>确认释放 BrowserScope 资源</strong>
+          <span>页面、调试状态和当前 Session 的 BrowserScope 浏览器资源会被关闭。工具选择仍保持 BrowserScope，不能改用其他浏览器插件。</span>
+          <span>后续再次调用 BrowserScope 工具时会创建新的 BrowserScope 页面。</span>
           <span className={css.controllerActions}>
-            <button type="button" disabled={switching} onClick={() => { void deactivate(false) }}>退出并保留页面</button>
-            <button type="button" disabled={switching} onClick={() => { void deactivate(true) }}>退出并释放资源</button>
-            <button type="button" disabled={switching} onClick={() => setConfirmDeactivate(false)}>取消</button>
+            <button type="button" disabled={switching} onClick={() => { void release() }}>确认释放</button>
+            <button type="button" disabled={switching} onClick={() => setConfirmRelease(false)}>取消</button>
           </span>
         </span>}
-        {controllerState?.conflictingTools.length ? <span className={css.controllerTools}>已仲裁：{controllerState.conflictingTools.join(', ')}</span> : null}
+        {controllerState?.conflictingTools.length
+          ? <button type="button" aria-expanded={arbitratedToolsOpen} onClick={() => setArbitratedToolsOpen(value => !value)}>
+              已仲裁工具（{controllerState.conflictingTools.length}）
+            </button>
+          : null}
       </span>}
+      {menu && arbitratedToolsOpen && controllerState?.conflictingTools.length
+        ? <span className={css.controllerToolsMenu} role="dialog" aria-label="已仲裁工具列表">
+            <span className={css.controllerToolsHeader}>
+              <strong>已仲裁工具（{controllerState.conflictingTools.length}）</strong>
+              <button type="button" aria-label="关闭已仲裁工具列表" onClick={() => setArbitratedToolsOpen(false)}>×</button>
+            </span>
+            <span className={css.controllerToolsList}>
+              {controllerState.conflictingTools.map(toolName => <span key={toolName}>{toolName}</span>)}
+            </span>
+          </span>
+        : null}
       {message !== undefined && <span className={css.controlMessage}>{message}</span>}
     </span>
   )
 }
 
-function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionSlotProps<'details'> & {
+function BrowserPanel({ sessionId, port, controller, useTabInfo }: SessionSlotProps<'sidebar.right.pane.tab'> & {
   port: Port
-  view: BrowserPanelView
-  onClose(): void
-  onViewChange(view: BrowserPanelView): void
+  controller: PanelController
 }) {
+  const { tab } = useTabInfo()
+  const params = tab.navigation.params as BrowserTabParams | undefined
+  const view = isBrowserPanelView(params?.view) ? params.view : 'live'
+  const onClose = tab.actions.close
+  const onViewChange = (next: BrowserPanelView) => tab.actions.openTab(BROWSER_TAB_KIND, { params: { view: next } })
+  const closeTabRef = useRef(onClose)
+  const openTabRef = useRef(onViewChange)
+  closeTabRef.current = onClose
+  openTabRef.current = onViewChange
+
+  useEffect(() => controller.attach(
+    sessionId,
+    tab.id,
+    () => closeTabRef.current(),
+    next => openTabRef.current(next),
+  ), [controller, sessionId, tab.id])
+  useEffect(() => {
+    controller.update(sessionId, tab.id, view)
+  }, [controller, sessionId, tab.id, view])
+
   const [snapshot, setSnapshot] = useState<BrowserPanelSnapshot>({ available: false, sessionId, tabs: [], console: [], network: [] })
   const [error, setError] = useState<string>()
   const [breakpointUrl, setBreakpointUrl] = useState('')
@@ -553,6 +489,7 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
   const topCanvasRef = useRef<HTMLDivElement>(null)
   const bottomCanvasRef = useRef<HTMLDivElement>(null)
   const splitContainerRef = useRef<HTMLDivElement>(null)
+  const liveViewInitializedSessionRef = useRef<string>()
   const debuggerStatus = snapshot.debugger?.paused
     ? `已暂停${snapshot.debugger.reason === undefined ? '' : `：${snapshot.debugger.reason}`}`
     : snapshot.debugger?.attached
@@ -634,7 +571,7 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
   }
   const runEmulate = (input: BrowserEmulateInput) => run(() => port.emulate(sessionId, input), 'Emulation 操作需要恢复后重试。')
   const runLiveView = (input: BrowserLiveViewInput) => run(() => port.liveView(sessionId, input), '实况显示模式切换需要恢复后重试。')
-  const runSplitView = (input: BrowserSplitViewInput) => run(() => port.splitView(sessionId, input), '浏览器上下分屏操作需要恢复后重试。')
+  const runSplitView = (input: BrowserSplitViewInput) => run(() => port.splitView(sessionId, input), '浏览器双页分屏操作需要恢复后重试。')
   const runTakeover = (input: BrowserTakeoverInput) => run(() => port.takeover(sessionId, input), '接管操作需要恢复后重试。')
   const runRecorder = (input: BrowserRecorderInput) => run(() => port.recorder(sessionId, input), 'Recorder 操作需要恢复后重试。')
   const runInput = async (input: UntracedBrowserUserInput, clientRawAt = Date.now()) => {
@@ -678,6 +615,7 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
     }
   }
   const activeTab = snapshot.tabs.find(item => item.viewId === snapshot.activeViewId)
+  const splitOrientation = snapshot.splitView?.orientation ?? 'top-bottom'
   const paneSnapshot = (pane: BrowserSplitViewPane): BrowserLivePaneSnapshot | undefined => snapshot.splitView?.panes?.find(item => item.pane === pane)
   const liveIdentity = (pane?: BrowserSplitViewPane) => {
     const target = pane === undefined ? undefined : paneSnapshot(pane)
@@ -1005,15 +943,20 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
   useEffect(() => {
     if (view !== 'live' || !snapshot.available) return
     const hostRatio = snapshot.splitView?.ratio ?? 0.5
-    // 拖动内部横向分界线时只改变本地Grid；Host确认最终比例后再同步两个真实Viewport，避免拖动过程产生RPC洪泛。
+    // 拖动分界线时只改变本地 Grid；Host 确认最终比例后再同步真实 Viewport，避免拖动过程产生 RPC 洪泛。
     if (snapshot.splitView?.enabled && Math.abs(splitRatio - hostRatio) > 0.001) return
     const canvases = snapshot.splitView?.enabled
       ? [{ pane: 'top' as const, element: topCanvasRef.current }, { pane: 'bottom' as const, element: bottomCanvasRef.current }]
       : [{ pane: undefined, element: liveCanvasRef.current }]
     if (canvases.some(item => item.element === null)) return
+
+    if (snapshot.liveView?.initialized === true) liveViewInitializedSessionRef.current = sessionId
+    else if (liveViewInitializedSessionRef.current !== sessionId) liveViewInitializedSessionRef.current = undefined
+
     let disposed = false
     let timer: ReturnType<typeof setTimeout> | undefined
-    let initialized = false
+    let measurementGeneration = 0
+    let pending = Promise.resolve()
     const previous = new Map<string, { width: number; height: number }>()
     const measure = (pane: BrowserSplitViewPane | undefined, canvas: HTMLDivElement) => {
       const rect = canvas.getBoundingClientRect()
@@ -1025,40 +968,47 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
         && rect.bottom <= window.innerHeight + 1
       const key = pane ?? 'single'
       const before = previous.get(key)
+      const minimumWidth = pane === undefined ? 320 : splitOrientation === 'left-right' ? 160 : 320
       const minimumHeight = pane === undefined ? 240 : 120
-      if (!visible || width < 320 || height < minimumHeight || (before !== undefined && Math.abs(width - before.width) < 2 && Math.abs(height - before.height) < 2)) return undefined
+      if (!visible || width < minimumWidth || height < minimumHeight || (before !== undefined && Math.abs(width - before.width) < 2 && Math.abs(height - before.height) < 2)) return undefined
       previous.set(key, { width, height })
       return { pane, width, height }
     }
-    const applySizes = async () => {
-      for (const item of canvases) {
-        if (disposed) return
-        const size = measure(item.pane, item.element as HTMLDivElement)
-        if (size === undefined) continue
-        if (size.pane !== undefined) {
-          // 上下窗格必须按顺序完成Viewport更新，第一侧响应引发的渲染不能打断第二侧上报。
-          await runSplitView({ action: 'resize', pane: size.pane, width: size.width, height: size.height })
-        } else if (!initialized) {
-        initialized = true
-          await runLiveView({ action: 'initialize', mode: liveViewPreference(), width: size.width, height: size.height })
-        } else {
-          await runLiveView({ action: 'resize', width: size.width, height: size.height })
+    const applySizes = (generation: number) => {
+      pending = pending.then(async () => {
+        if (disposed || generation !== measurementGeneration) return
+        for (const item of canvases) {
+          if (disposed || generation !== measurementGeneration) return
+          const size = measure(item.pane, item.element as HTMLDivElement)
+          if (size === undefined) continue
+          if (size.pane !== undefined) {
+            // 两个窗格按顺序更新，第一侧响应引发的渲染不能打断第二侧上报。
+            await runSplitView({ action: 'resize', pane: size.pane, width: size.width, height: size.height })
+          } else if (liveViewInitializedSessionRef.current !== sessionId) {
+            liveViewInitializedSessionRef.current = sessionId
+            await runLiveView({ action: 'initialize', mode: liveViewPreference(), width: size.width, height: size.height })
+          } else {
+            await runLiveView({ action: 'resize', width: size.width, height: size.height })
+          }
         }
-      }
+      }).catch(() => {})
     }
-    const observer = new ResizeObserver(() => {
+    const schedule = () => {
+      const generation = ++measurementGeneration
       if (timer !== undefined) clearTimeout(timer)
-      timer = setTimeout(() => { if (!disposed) void applySizes() }, 180)
-    })
+      timer = setTimeout(() => { if (!disposed) applySizes(generation) }, 180)
+    }
+    const observer = new ResizeObserver(schedule)
     for (const item of canvases) observer.observe(item.element as HTMLDivElement)
-    timer = setTimeout(() => { if (!disposed) void applySizes() }, 180)
+    schedule()
     return () => {
       disposed = true
+      measurementGeneration += 1
       if (timer !== undefined) clearTimeout(timer)
       observer.disconnect()
     }
-  // 分屏比例改变会同时改变上下两个画布；把 ratio 纳入依赖可在 Grid 稳定后重新测量两侧，避免早期回调只上报先达到有效尺寸的一个窗格。
-  }, [port, sessionId, view, snapshot.available, snapshot.splitView?.enabled, snapshot.splitView?.ratio, splitRatio])
+  // 分屏比例或方向改变会同时改变两个画布；依赖变化后重新测量，但初始化状态由 Host 快照和 Session ref 保持，不会退回 initialize。
+  }, [port, sessionId, view, snapshot.available, snapshot.liveView?.initialized, snapshot.splitView?.enabled, snapshot.splitView?.orientation, snapshot.splitView?.ratio, splitRatio])
   useEffect(() => {
     // 地址栏只跟随活动标签变化，不在轮询到相同标签时反复覆盖用户正在编辑但尚未提交的文本。
     setAddress(activeTab?.url ?? '')
@@ -1125,17 +1075,20 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
     const container = splitContainerRef.current
     if (container === null) return
     event.currentTarget.setPointerCapture(event.pointerId)
-    const move = (pointer: PointerEvent) => {
+    const ratioAt = (pointer: PointerEvent) => {
       const rect = container.getBoundingClientRect()
-      setSplitRatio(Math.min(Math.max((pointer.clientY - rect.top) / Math.max(rect.height, 1), 0.4), 0.6))
+      const raw = splitOrientation === 'left-right'
+        ? (pointer.clientX - rect.left) / Math.max(rect.width, 1)
+        : (pointer.clientY - rect.top) / Math.max(rect.height, 1)
+      return Math.min(Math.max(raw, 0.4), 0.6)
     }
+    const move = (pointer: PointerEvent) => { setSplitRatio(ratioAt(pointer)) }
     const finish = (pointer: PointerEvent) => {
-      move(pointer)
+      const ratio = ratioAt(pointer)
+      setSplitRatio(ratio)
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', finish)
-      const rect = container.getBoundingClientRect()
-      const ratio = Math.min(Math.max((pointer.clientY - rect.top) / Math.max(rect.height, 1), 0.4), 0.6)
-      // 拖动期间只更新本地 Grid，松开后提交一次最终比例，避免连续重建两个真实浏览器 Viewport造成卡顿。
+      // 拖动期间只更新本地 Grid，松开后提交一次最终比例，避免连续重建两个真实浏览器 Viewport 造成卡顿。
       void runSplitView({ action: 'ratio', ratio, notifyAgent: true })
     }
     window.addEventListener('pointermove', move)
@@ -1143,8 +1096,10 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
   }
   const adjustSplitByKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
     let ratio = splitRatio
-    if (event.key === 'ArrowUp') ratio = Math.min(ratio + 0.02, 0.6)
-    else if (event.key === 'ArrowDown') ratio = Math.max(ratio - 0.02, 0.4)
+    const increaseKey = splitOrientation === 'left-right' ? 'ArrowLeft' : 'ArrowUp'
+    const decreaseKey = splitOrientation === 'left-right' ? 'ArrowRight' : 'ArrowDown'
+    if (event.key === increaseKey) ratio = Math.min(ratio + 0.02, 0.6)
+    else if (event.key === decreaseKey) ratio = Math.max(ratio - 0.02, 0.4)
     else if (event.key === 'Home') ratio = 0.4
     else if (event.key === 'End') ratio = 0.6
     else return
@@ -1156,7 +1111,9 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
     const paneState = paneSnapshot(pane)
     const imageRef = pane === 'top' ? topLiveRef : bottomLiveRef
     const canvasRef = pane === 'top' ? topCanvasRef : bottomCanvasRef
-    const fullLabel = pane === 'top' ? '上方网页' : '下方网页'
+    const fullLabel = splitOrientation === 'left-right'
+      ? pane === 'top' ? '左侧网页' : '右侧网页'
+      : pane === 'top' ? '上方网页' : '下方网页'
     return <div className={css.livePane} data-focused={paneState?.focused || undefined} aria-label={`${fullLabel}${paneState?.focused ? '，当前焦点' : '，点击画面切换焦点'}`}>
       <div ref={canvasRef} className={css.liveCanvas} onPointerDown={() => { if (paneState?.focused !== true) void runSplitView({ action: 'focus', pane, notifyAgent: true }) }}>
         {paneState?.frame === undefined
@@ -1305,11 +1262,17 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
             <div className={css.liveControlActions}>
               <button type="button" aria-label="切换为标准显示" title="标准显示：固定1280×720，完整显示桌面布局" data-selected={snapshot.liveView?.mode === 'standard' || undefined} onClick={() => { void switchLiveView('standard') }}>标准显示</button>
               <button type="button" aria-label="切换为自适应显示" title="自适应显示：真实Viewport跟随可用区域" data-selected={snapshot.liveView?.mode === 'adaptive' || undefined} onClick={() => { void switchLiveView('adaptive') }}>自适应显示</button>
-              <button type="button" aria-label={snapshot.splitView?.enabled ? '返回单页显示' : '开启上下双页显示'} title={snapshot.splitView?.enabled ? '关闭上下双页并保留焦点标签' : '开启上下双页显示'} onClick={() => { void runSplitView({ action: snapshot.splitView?.enabled ? 'close' : 'open', notifyAgent: true }) }}>{snapshot.splitView?.enabled ? '返回单页' : '开启双页'}</button>
-              {snapshot.splitView?.enabled && <>
-                <button type="button" aria-label="交换上下网页" title="交换上下网页" onClick={() => { void runSplitView({ action: 'swap', notifyAgent: true }) }}>交换上下</button>
-                <button type="button" aria-label="恢复上下均分" title="恢复上下50/50均分" onClick={() => { void runSplitView({ action: 'ratio', ratio: 0.5, notifyAgent: true }) }}>恢复均分</button>
-              </>}
+              {!snapshot.splitView?.enabled
+                ? <>
+                    <button type="button" aria-label="开启上下双页显示" title="将两个网页按上下排列" onClick={() => { void runSplitView({ action: 'open', orientation: 'top-bottom', notifyAgent: true }) }}>上下双页</button>
+                    <button type="button" aria-label="开启左右双页显示" title="将两个网页按左右排列" onClick={() => { void runSplitView({ action: 'open', orientation: 'left-right', notifyAgent: true }) }}>左右双页</button>
+                  </>
+                : <>
+                    <button type="button" aria-label="返回单页显示" title="关闭双页并保留焦点标签" onClick={() => { void runSplitView({ action: 'close', notifyAgent: true }) }}>返回单页</button>
+                    <button type="button" aria-label={splitOrientation === 'left-right' ? '切换为上下双页' : '切换为左右双页'} onClick={() => { void runSplitView({ action: 'orientation', orientation: splitOrientation === 'left-right' ? 'top-bottom' : 'left-right', notifyAgent: true }) }}>{splitOrientation === 'left-right' ? '切换上下' : '切换左右'}</button>
+                    <button type="button" aria-label={splitOrientation === 'left-right' ? '交换左右网页' : '交换上下网页'} onClick={() => { void runSplitView({ action: 'swap', notifyAgent: true }) }}>{splitOrientation === 'left-right' ? '交换左右' : '交换上下'}</button>
+                    <button type="button" aria-label="恢复双页均分" title="恢复50/50均分" onClick={() => { void runSplitView({ action: 'ratio', ratio: 0.5, notifyAgent: true }) }}>恢复均分</button>
+                  </>}
               <button type="button" aria-label={snapshot.control?.owner === 'user' ? '归还浏览器控制权给模型' : '人工接管浏览器'} title={snapshot.control?.owner === 'user' ? '归还浏览器控制权给模型' : '人工接管；接管后点击网页并直接使用键盘'} onClick={() => { void runTakeover({ action: snapshot.control?.owner === 'user' ? 'return' : 'request' }) }}>{snapshot.control?.owner === 'user' ? '归还模型' : '人工接管'}</button>
               <button type="button" disabled={snapshot.control?.owner !== 'user'} aria-pressed={shareDragArmed} aria-label={shareDragArmed ? '取消拖拽分享画面' : '武装下一次拖拽分享画面'} title={snapshot.control?.owner !== 'user' ? '请先人工接管浏览器' : shareDragArmed ? '下一次从实况画面拖动会生成对话图片附件；拖拽结束后自动关闭' : '仅武装下一次画面拖拽，普通拖动不会生成附件'} data-selected={shareDragArmed || undefined} onClick={() => { setShareDragArmed(value => !value) }}>{shareDragArmed ? '等待拖拽画面' : '拖拽分享画面'}</button>
               <button type="button" aria-expanded={extensionMenuOpen} aria-label="使用浏览器扩展" title="打开当前 Session 中可用的扩展列表" onClick={() => { if (extensionMenuOpen) setExtensionMenuOpen(false); else void openExtensionMenu() }}>使用扩展</button>
@@ -1344,9 +1307,28 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
           <button type="button" className={css.extensionMenuManage} onClick={() => { setExtensionMenuOpen(false); onViewChange('extensions') }}>管理扩展</button>
         </div>}
         {snapshot.splitView?.enabled
-          ? <div ref={splitContainerRef} className={css.splitLive} style={{ gridTemplateRows: `minmax(0, ${splitRatio}fr) 8px minmax(0, ${1 - splitRatio}fr)` }}>
+          ? <div
+              ref={splitContainerRef}
+              className={css.splitLive}
+              data-orientation={splitOrientation}
+              style={splitOrientation === 'left-right'
+                ? { gridTemplateColumns: `minmax(0, ${splitRatio}fr) 8px minmax(0, ${1 - splitRatio}fr)` }
+                : { gridTemplateRows: `minmax(0, ${splitRatio}fr) 8px minmax(0, ${1 - splitRatio}fr)` }}
+            >
             {livePane('top')}
-            <div className={css.splitDivider} role="separator" tabIndex={0} aria-label="调整上下分屏比例" aria-orientation="horizontal" aria-valuemin={40} aria-valuemax={60} aria-valuenow={Math.round(splitRatio * 100)} onPointerDown={beginSplitResize} onKeyDown={adjustSplitByKey} />
+            <div
+              className={css.splitDivider}
+              data-orientation={splitOrientation}
+              role="separator"
+              tabIndex={0}
+              aria-label={splitOrientation === 'left-right' ? '调整左右分屏比例' : '调整上下分屏比例'}
+              aria-orientation={splitOrientation === 'left-right' ? 'vertical' : 'horizontal'}
+              aria-valuemin={40}
+              aria-valuemax={60}
+              aria-valuenow={Math.round(splitRatio * 100)}
+              onPointerDown={beginSplitResize}
+              onKeyDown={adjustSplitByKey}
+            />
             {livePane('bottom')}
           </div>
           : <div ref={liveCanvasRef} className={css.liveCanvas}>
@@ -1625,14 +1607,22 @@ function BrowserPanel({ sessionId, port, view, onClose, onViewChange }: SessionS
   )
 }
 
-export const inject = ['slots', 'connection']
+export const inject = [
+  'slots',
+  'connection',
+  'sidebarRight',
+  'sidebarRightTabs',
+]
 
 export function apply(ctx: BrowserClientContext): void {
-  const call = async <T,>(endpoint: string, payload: unknown): Promise<T> => valueOf<T>(await ctx.connection.rpc.call(CHANNEL, endpoint, payload))
+  // BrowserScope 的所有面板动作共用 Connection 已认证的精确 /api/browser-tools 路由。
+  // 外层 RPC method 固定用于匹配 Fetch Route，原 endpoint 保留在 payload 中交给 Host
+  // 的业务分发器处理，因此不会改变 Controller、面板视图或 Session 隔离语义。
+  const call = async <T,>(endpoint: string, payload: unknown): Promise<T> => valueOf<T>(await ctx.connection.rpc.call(CHANNEL, RPC_METHOD, { endpoint, payload }))
   const port: Port = {
     controllerStatus: sessionId => call('controller_status', { sessionId }),
     controllerActivate: sessionId => call('controller_activate', { sessionId }),
-    controllerDeactivate: sessionId => call('controller_deactivate', { sessionId }),
+    controllerSelectOther: sessionId => call('controller_select_other', { sessionId }),
     controllerRelease: sessionId => call('controller_release', { sessionId }),
     snapshot: (sessionId, view, streamGeneration, sequence, splitCursors, popupCursor, diagnosticReadSequence) => call('snapshot', { sessionId, view, streamGeneration, sequence, splitCursors, popupCursor, diagnosticReadSequence }),
     tabs: (sessionId, input) => call('tabs', { sessionId, ...input }),
@@ -1650,58 +1640,101 @@ export function apply(ctx: BrowserClientContext): void {
     recorder: (sessionId, input) => call('recorder', { sessionId, ...input }),
     close: async (sessionId, view) => { await call('close', { sessionId, view }) },
   }
-  let activeSessionId: string | undefined
-  let activeView: BrowserPanelView | undefined
-  let disposePanel = () => {}
-  let disposeSplit = () => {}
-  const listeners = new Set<(state: { open: boolean; sessionId?: string; view?: BrowserPanelView }) => void>()
-  const notify = () => {
-    const state = activeSessionId === undefined || activeView === undefined
-      ? { open: false }
-      : { open: true, sessionId: activeSessionId, view: activeView }
-    for (const listener of listeners) listener(state)
+  interface MountedBrowserTab {
+    tabId: string
+    view?: BrowserPanelView
+    closeTab(): void
+    openTab(view: BrowserPanelView): void
+    token: object
   }
-  const close = () => {
-    if (activeSessionId !== undefined && activeView !== undefined) {
-      // close 属于 UI 卸载时的尽力清理。Session 身份切换可能让旧 Controller 已先退出，
-      // Host 此时拒绝旧 close RPC 是正确安全行为；必须收敛 Promise，避免形成页面未处理拒绝。
-      void port.close(activeSessionId, activeView).catch(() => {})
-    }
-    activeSessionId = undefined
-    activeView = undefined
-    disposePanel()
-    disposePanel = () => {}
-    disposeSplit()
-    disposeSplit = () => {}
-    notify()
+
+  const mountedTabs = new Map<string, MountedBrowserTab>()
+  const listeners = new Map<string, Set<(state: { open: boolean; view?: BrowserPanelView }) => void>>()
+  const snapshot = (sessionId: string): { open: boolean; view?: BrowserPanelView } => {
+    const mounted = mountedTabs.get(sessionId)
+    return mounted === undefined ? { open: false } : { open: true, view: mounted.view }
   }
+  const notify = (sessionId: string) => {
+    const state = snapshot(sessionId)
+    for (const listener of listeners.get(sessionId) ?? []) listener(state)
+  }
+
   const controller: PanelController = {
     open(sessionId, view) {
-      close()
-      const split = setSplit(close)
-      if (!split.ok) {
-        notify()
-        return split
+      try {
+        const mounted = mountedTabs.get(sessionId)
+        if (mounted !== undefined) {
+          // 从标签自身发起导航，DSH 会在该标签所属 Pane 内复用页面型 Tab；这能避免多 Pane 布局下在当前活动 Pane 新建重复 BrowserScope。
+          mounted.openTab(view)
+        } else {
+          // 尚无已挂载标签时使用公共服务打开；服务负责展开右侧栏、创建页面型 Tab，并把 view 写入导航参数。
+          ctx.sidebarRight.openTab(BROWSER_TAB_KIND, { params: { view } })
+        }
+        return { ok: true }
+      } catch (cause) {
+        return { ok: false, message: cause instanceof Error ? cause.message : String(cause) }
       }
-      disposeSplit = split.dispose
-      activeSessionId = sessionId
-      activeView = view
-      disposePanel = ctx.slots.register({ name: 'details', priority: -100, inject: () => ({ port, view, onClose: close, onViewChange: (next: BrowserPanelView) => { controller.open(sessionId, next) } }) }, BrowserPanel)
-      notify()
-      return { ok: true }
     },
-    close,
-    subscribe(listener) {
-      listeners.add(listener)
-      listener(activeSessionId === undefined || activeView === undefined
-        ? { open: false }
-        : { open: true, sessionId: activeSessionId, view: activeView })
-      return () => { listeners.delete(listener) }
+    close(sessionId) {
+      const targets = sessionId === undefined
+        ? [...mountedTabs.entries()]
+        : [...mountedTabs.entries()].filter(([mountedSessionId]) => mountedSessionId === sessionId)
+      for (const [mountedSessionId, mounted] of targets) {
+        // closeTab 绑定到标签自己的 Session Store；即使用户已经切换会话，也不会误关当前会话中同类型的标签。
+        mountedTabs.delete(mountedSessionId)
+        mounted.closeTab()
+        notify(mountedSessionId)
+      }
+    },
+    attach(sessionId, tabId, closeTab, openTab) {
+      const token = {}
+      mountedTabs.set(sessionId, { tabId, closeTab, openTab, token })
+      notify(sessionId)
+      return () => {
+        // React 可能先挂载新实例再清理旧实例；只有令牌仍匹配时才删除，避免旧 cleanup 把新标签错误标记为关闭。
+        if (mountedTabs.get(sessionId)?.token !== token) return
+        mountedTabs.delete(sessionId)
+        notify(sessionId)
+      }
+    },
+    update(sessionId, tabId, view) {
+      const mounted = mountedTabs.get(sessionId)
+      if (mounted === undefined || mounted.tabId !== tabId || mounted.view === view) return
+      mounted.view = view
+      notify(sessionId)
+    },
+    subscribe(sessionId, listener) {
+      let sessionListeners = listeners.get(sessionId)
+      if (sessionListeners === undefined) {
+        sessionListeners = new Set()
+        listeners.set(sessionId, sessionListeners)
+      }
+      sessionListeners.add(listener)
+      listener(snapshot(sessionId))
+      return () => {
+        sessionListeners?.delete(listener)
+        if (sessionListeners?.size === 0) listeners.delete(sessionId)
+      }
     },
   }
-  ctx.slots.inject('conversation.input.right', () => ctx.slots.register({
-    name: 'conversation.input.right', id: 'browser-panel', order: 50,
+
+  // RC.1 右侧栏要求先注册静态 Tab 类型，再以相同 id/key 注册会话级内容；二者由 Cordis Effect 统一管理卸载顺序。
+  ctx.effect(() => ctx.sidebarRightTabs.register({
+    id: BROWSER_TAB_ID,
+    kind: BROWSER_TAB_KIND,
+    priority: 'extension',
+    title: () => 'BrowserScope',
+  }), 'browser scope tab type')
+  ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+    name: 'sidebar.right.pane.tab',
+    key: BROWSER_TAB_ID,
+    inject: () => ({ port, controller }),
+  }, BrowserPanel)), 'browser scope tab body')
+  ctx.effect(() => ctx.slots.inject('conversation.input.right', () => ctx.slots.register({
+    name: 'conversation.input.right',
+    id: 'browser-panel',
+    order: 50,
     inject: () => ({ controller, port }),
-  }, BrowserControl))
-  ctx.effect(() => close, 'browser panel cleanup')
+  }, BrowserControl)), 'browser scope conversation control')
+  ctx.effect(() => () => controller.close(), 'browser scope panel cleanup')
 }

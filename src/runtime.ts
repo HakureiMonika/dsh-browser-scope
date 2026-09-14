@@ -39,7 +39,7 @@ const WINDOWS_BROWSERS = [
 
 const STANDARD_VIEWPORT = { width: 1280, height: 720 } as const
 const MIN_ADAPTIVE_VIEWPORT = { width: 320, height: 240 } as const
-const MIN_SPLIT_ADAPTIVE_VIEWPORT = { width: 320, height: 120 } as const
+const MIN_SPLIT_ADAPTIVE_VIEWPORT = { width: 160, height: 120 } as const
 const MAX_ADAPTIVE_VIEWPORT = { width: 1920, height: 1200 } as const
 const ADAPTIVE_REFLOW_ATTRIBUTE = 'data-dsh-browser-tools-adaptive-reflow'
 
@@ -142,15 +142,37 @@ export class BrowserRuntime {
     await this.releaseHandles(handles)
   }
 
-  private splitViewState(ratio = 0.5): SessionState['splitView'] {
-    // activeViewId 仍是现有 28 个工具的默认操作目标；分屏状态只补充两个可见窗格，避免破坏既有工具协议。
+  private splitViewState(preference: { ratio: number; orientation: 'top-bottom' | 'left-right' } = { ratio: 0.5, orientation: 'top-bottom' }): SessionState['splitView'] {
+    // activeViewId 仍是现有工具的默认操作目标；top/bottom 保留为兼容窗格身份，orientation 只决定视觉排列方式。
     return {
       enabled: false,
       focusedPane: 'top',
-      ratio,
+      orientation: preference.orientation,
+      ratio: preference.ratio,
       changedAt: Date.now(),
       panes: { top: {}, bottom: {} },
     }
+  }
+
+  private browserLaunchNetwork(): {
+    args: string[]
+    proxy?: { server: string; bypass?: string; username?: string; password?: string }
+  } {
+    // system 模式不传 Playwright proxy，让 Chromium 使用操作系统代理；direct 只添加官方直连参数；
+    // custom 通过 Playwright 原生代理对象传递，密码不会进入命令行、日志或页面可见 URL。
+    if (this.config.proxy.mode === 'direct') return { args: ['--no-proxy-server'] }
+    if (this.config.proxy.mode === 'custom') {
+      return {
+        args: [],
+        proxy: {
+          server: this.config.proxy.server as string,
+          ...(this.config.proxy.bypass === undefined ? {} : { bypass: this.config.proxy.bypass }),
+          ...(this.config.proxy.username === undefined ? {} : { username: this.config.proxy.username }),
+          ...(this.config.proxy.password === undefined ? {} : { password: this.config.proxy.password }),
+        },
+      }
+    }
+    return { args: [] }
   }
 
   private executablePath(): string | undefined {
@@ -162,10 +184,12 @@ export class BrowserRuntime {
     if (this.state.disposed) fail('PROVIDER_UNAVAILABLE', 'browser provider is disposed')
     if (this.state.browser?.isConnected()) return this.state.browser
     if (this.state.launch === undefined) {
+      const network = this.browserLaunchNetwork()
       this.state.launch = chromium.launch({
         ...(this.executablePath() === undefined ? {} : { executablePath: this.executablePath() }),
         headless: this.config.headless,
-        args: ['--disable-background-networking', '--disable-component-update', '--disable-sync', '--no-first-run'],
+        ...(network.proxy === undefined ? {} : { proxy: network.proxy }),
+        args: network.args,
       }).then(browser => {
         this.state.browser = browser
         this.state.launch = undefined
@@ -260,16 +284,15 @@ export class BrowserRuntime {
       ? this.executablePath()
       : await this.chromiumManager.ensureInstalled()
     const extensionPaths = enabled.map(extension => extension.path)
+    const network = this.browserLaunchNetwork()
     const context = await chromium.launchPersistentContext(this.profiles.profilePath(sessionId, profileName), {
       ...(executablePath === undefined ? {} : { executablePath }),
       headless: this.config.headless,
       acceptDownloads: true,
       serviceWorkers: 'allow',
+      ...(network.proxy === undefined ? {} : { proxy: network.proxy }),
       args: [
-        '--disable-background-networking',
-        '--disable-component-update',
-        '--disable-sync',
-        '--no-first-run',
+        ...network.args,
         ...(extensionPaths.length === 0
           ? []
           : [
@@ -293,16 +316,15 @@ export class BrowserRuntime {
       ? this.executablePath()
       : await this.chromiumManager.ensureInstalled()
     const extensionPaths = enabled.map(extension => extension.path)
+    const network = this.browserLaunchNetwork()
     const context = await chromium.launchPersistentContext(this.profiles.sharedProfilePath(), {
       ...(executablePath === undefined ? {} : { executablePath }),
       headless: this.config.headless,
       acceptDownloads: true,
       serviceWorkers: 'allow',
+      ...(network.proxy === undefined ? {} : { proxy: network.proxy }),
       args: [
-        '--disable-background-networking',
-        '--disable-component-update',
-        '--disable-sync',
-        '--no-first-run',
+        ...network.args,
         ...(extensionPaths.length === 0
           ? []
           : [
@@ -1353,7 +1375,7 @@ export class BrowserRuntime {
     }
   }
 
-  private restorableTabs(session: SessionState): { urls: string[]; activeIndex: number; split?: { topIndex: number; bottomIndex: number; focusedPane: BrowserSplitViewPane; ratio: number } } {
+  private restorableTabs(session: SessionState): { urls: string[]; activeIndex: number; split?: { topIndex: number; bottomIndex: number; focusedPane: BrowserSplitViewPane; orientation: 'top-bottom' | 'left-right'; ratio: number } } {
     const views = [...session.views.values()].filter(view => view.kind === 'page' && !view.page.isClosed())
     const urls = views.map((view) => {
       const url = view.page.url()
@@ -1371,12 +1393,12 @@ export class BrowserRuntime {
       urls: urls.length === 0 ? ['about:blank'] : urls,
       activeIndex,
       ...(session.splitView.enabled && topIndex >= 0 && bottomIndex >= 0 && topIndex !== bottomIndex
-        ? { split: { topIndex, bottomIndex, focusedPane: session.splitView.focusedPane, ratio: session.splitView.ratio } }
+        ? { split: { topIndex, bottomIndex, focusedPane: session.splitView.focusedPane, orientation: session.splitView.orientation, ratio: session.splitView.ratio } }
         : {}),
     }
   }
 
-  private async restoreTabs(session: SessionState, tabs: { urls: string[]; activeIndex: number; split?: { topIndex: number; bottomIndex: number; focusedPane: BrowserSplitViewPane; ratio: number } }): Promise<void> {
+  private async restoreTabs(session: SessionState, tabs: { urls: string[]; activeIndex: number; split?: { topIndex: number; bottomIndex: number; focusedPane: BrowserSplitViewPane; orientation: 'top-bottom' | 'left-right'; ratio: number } }): Promise<void> {
     const pages = this.sessionPages(session)
     for (let index = 0; index < tabs.urls.length; index += 1) {
       const page = pages[index] ?? await this.createPage(session)
@@ -1404,6 +1426,7 @@ export class BrowserRuntime {
       session.splitView.topViewId = topView.viewId
       session.splitView.bottomViewId = bottomView.viewId
       session.splitView.focusedPane = tabs.split.focusedPane
+      session.splitView.orientation = tabs.split.orientation
       session.splitView.ratio = tabs.split.ratio
       session.splitView.changedAt = Date.now()
       session.activeViewId = tabs.split.focusedPane === 'top' ? topView.viewId : bottomView.viewId
@@ -1537,7 +1560,7 @@ export class BrowserRuntime {
       try {
         // 品牌 Chrome/Edge 已移除自动化扩展侧载参数；首次安装先准备插件专用 Chromium，同时用其浏览器网络栈作为官方商店下载回退。
         const chromiumExecutablePath = await this.chromiumManager.ensureInstalled()
-        installed = await downloadChromeWebStoreExtension(input.extension, staging, chromiumExecutablePath)
+        installed = await downloadChromeWebStoreExtension(input.extension, staging, chromiumExecutablePath, this.browserLaunchNetwork())
         const target = sharedMode
           ? this.profiles.sharedExtensionDirectory(installed.extensionId)
           : this.profiles.extensionDirectory(session.sessionId, installed.extensionId)
@@ -1756,6 +1779,7 @@ export class BrowserRuntime {
     return {
       enabled: session.splitView.enabled,
       focusedPane: session.splitView.focusedPane,
+      orientation: session.splitView.orientation,
       ratio: session.splitView.ratio,
       changedAt: session.splitView.changedAt,
       ...(session.splitView.topViewId === undefined ? {} : { topViewId: session.splitView.topViewId }),
@@ -1771,11 +1795,18 @@ export class BrowserRuntime {
     if (input.action === 'open') {
       let second = [...session.views.values()].find(view => view.kind === 'page' && !view.page.isClosed() && view.viewId !== current.viewId)
       if (second === undefined) second = this.bindView(session, await this.createPage(session))
+      if (input.orientation === 'top-bottom' || input.orientation === 'left-right') session.splitView.orientation = input.orientation
+      // 重新开启双页后容器尺寸必然改变，旧窗格测量不能跨关闭/重开复用。
+      session.splitView.panes.top = {}
+      session.splitView.panes.bottom = {}
       session.splitView.enabled = true
       session.splitView.topViewId = current.viewId
       session.splitView.bottomViewId = second.viewId
       session.splitView.focusedPane = 'top'
       session.activeViewId = current.viewId
+      if (input.orientation === 'top-bottom' || input.orientation === 'left-right') {
+        await this.profiles.saveSplitViewPreference(session.sessionId, { ratio: session.splitView.ratio, orientation: session.splitView.orientation })
+      }
       changed = true
     } else if (input.action === 'close') {
       if (session.splitView.enabled) {
@@ -1820,7 +1851,17 @@ export class BrowserRuntime {
       const ratio = Math.min(Math.max(input.ratio, 0.4), 0.6)
       changed = session.splitView.ratio !== ratio
       session.splitView.ratio = ratio
-      if (changed) await this.profiles.saveSplitViewRatio(session.sessionId, ratio)
+      if (changed) await this.profiles.saveSplitViewPreference(session.sessionId, { ratio, orientation: session.splitView.orientation })
+    } else if (input.action === 'orientation') {
+      if (!session.splitView.enabled || (input.orientation !== 'top-bottom' && input.orientation !== 'left-right')) fail('INVALID_ARGS', 'split orientation requires an open split and valid orientation')
+      changed = session.splitView.orientation !== input.orientation
+      session.splitView.orientation = input.orientation
+      if (changed) {
+        // 方向变化会改变两个画布的真实宽高；先清空旧测量，等待 Client 在新 Grid 稳定后分别上报，避免短暂沿用另一方向的比例。
+        session.splitView.panes.top = {}
+        session.splitView.panes.bottom = {}
+        await this.profiles.saveSplitViewPreference(session.sessionId, { ratio: session.splitView.ratio, orientation: input.orientation })
+      }
     } else if (input.action === 'resize') {
       if (!session.splitView.enabled || input.pane === undefined || input.width === undefined || input.height === undefined) fail('INVALID_ARGS', 'split resize requires pane, width, and height')
       const target = this.splitPaneView(session, input.pane)
@@ -1971,7 +2012,10 @@ export class BrowserRuntime {
   private async applyLiveViewport(session: SessionState, view: ViewState): Promise<void> {
     const pane = this.splitPaneForView(session, view.viewId)
     const paneSize = pane === undefined ? undefined : session.splitView.panes[pane]
-    // 自适应分屏必须使用每个窗格自己的真实尺寸；共用 Session 尺寸会让上、下网页互相覆盖 Viewport。
+    // 分屏刚开启或切换方向时，Client 需要等待新 Grid 稳定后才能得到真实窗格尺寸。
+    // 此时保持当前 Viewport，不能用单页尺寸临时覆盖两个窗格，否则会产生一次可见的比例抽搐。
+    if (session.liveView.mode === 'adaptive' && pane !== undefined && (paneSize?.adaptiveWidth === undefined || paneSize.adaptiveHeight === undefined)) return
+    // 自适应分屏必须使用每个窗格自己的真实尺寸；共用 Session 尺寸会让两个网页互相覆盖 Viewport。
     const viewport = session.liveView.mode === 'adaptive' && paneSize?.adaptiveWidth !== undefined && paneSize.adaptiveHeight !== undefined
       ? { width: paneSize.adaptiveWidth, height: paneSize.adaptiveHeight }
       : this.liveViewport(session)
@@ -1991,6 +2035,7 @@ export class BrowserRuntime {
   private liveViewState(session: SessionState, view: ViewState) {
     return {
       mode: session.liveView.mode,
+      initialized: session.liveView.initialized,
       width: view.viewport.width,
       height: view.viewport.height,
       viewportGeneration: view.viewport.generation,
@@ -3829,7 +3874,7 @@ export class BrowserRuntime {
       if (concurrent !== undefined) return concurrent
       await this.sharedPersistentContext()
       const shared = this.state.sharedPersistent
-      const splitRatio = await this.profiles.splitViewRatio(identity.sessionId)
+      const splitPreference = await this.profiles.splitViewPreference(identity.sessionId)
       const session: SessionState = {
         key,
         sessionId: identity.sessionId,
@@ -3839,7 +3884,7 @@ export class BrowserRuntime {
         loadedExtensions: [...shared.loadedExtensions],
         views: new Map(),
         activeViewId: '',
-        splitView: this.splitViewState(splitRatio),
+        splitView: this.splitViewState(splitPreference),
         nextViewId: 1,
         queue: Promise.resolve(),
         provider: 'managed-persistent',
@@ -4855,7 +4900,7 @@ export class BrowserRuntime {
           if (existingPending !== undefined) return existingPending
           await this.sharedPersistentContext()
           const shared = this.state.sharedPersistent
-          const splitRatio = await this.profiles.splitViewRatio(sessionId)
+          const splitPreference = await this.profiles.splitViewPreference(sessionId)
           const pending: SessionState = {
             key: pendingKey,
             sessionId,
@@ -4865,7 +4910,7 @@ export class BrowserRuntime {
             loadedExtensions: [...shared.loadedExtensions],
             views: new Map(),
             activeViewId: '',
-            splitView: this.splitViewState(splitRatio),
+            splitView: this.splitViewState(splitPreference),
             nextViewId: 1,
             queue: Promise.resolve(),
             provider: 'managed-persistent',
@@ -5062,6 +5107,7 @@ export class BrowserRuntime {
       },
       liveView: {
         mode: session.liveView.mode,
+        initialized: session.liveView.initialized,
         width: current.viewport.width,
         height: current.viewport.height,
         viewportGeneration: current.viewport.generation,
