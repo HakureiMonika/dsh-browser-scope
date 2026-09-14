@@ -11,13 +11,17 @@
 ![Node](https://img.shields.io/badge/Node-%5E22.19.0%20%7C%7C%20%3E%3D24.0.0-16A34A?style=for-the-badge&logo=nodedotjs&logoColor=white)
 ![Status](https://img.shields.io/badge/status-Release%20Candidate-F97316?style=for-the-badge)
 
-[立即安装](#安装) · [看图了解](#能力展示) · [30 个工具](#功能介绍) · [测试结果](#能力测试结果) · [技术细节](./TECHNICAL.md) · [English](./README.en.md)
+[立即安装](#安装) · [看图了解](#能力展示) · [30 个工具](#功能介绍) · [测试结果](#能力测试结果) · [技术细节](./TECHNICAL.md) <br> <br>
+当前语言为简体中文 | [English](./README.en.md)
 
 </div>
 
 ---
 
-![BrowserScope 嵌入 DSH Web 的实况工作台](./assets/browser-scope-hero.png)
+> [!IMPORTANT]
+> 这是独立开发的社区插件，不是 DeepSeek 官方发布、维护或背书的插件。它不会修改 DeepSeek Harness 的核心代码。<br>
+> 本插件仍在开发中，若遭遇**bug**或任何意料外的情况均可通过issue向开发者汇报。
+>> *如果该插件帮上你的忙了，还请点颗星让更多人看见~非常感谢 Thanks♪(･ω･)ﾉ*
 
 ## 插件简介
 
@@ -26,6 +30,8 @@
 BrowserScope 在 DSH Web 右侧栏嵌入一个完整的 Chromium 工作台，配备 30 个专门定制的自动化工具。Agent 现在能直接读页面结构、操作元素、查看 Console、追踪请求、下断点、读调用栈、解析 Source Map、分析性能，并把操作前后的完整现场记录下来。从基础的点击滑动，到深度的断点调试和性能瓶颈定位，全在一个 Session 里完成。
 
 支持多插件共存，适配 DSH `0.1.5-rc.2`。每个正式 Session 第一次使用浏览器前，需要选择 BrowserScope 或当前 Profile 中已有的其他浏览器工具。选定后，该 Session 会一直使用同一套工具；其他 Session 可以独立选择。这样可以避免不同插件的页面、标签、元素引用和登录状态互相混用。
+
+![BrowserScope 嵌入 DSH Web 的实况工作台](./assets/browser-scope-hero.png)
 
 ## 目录
 
