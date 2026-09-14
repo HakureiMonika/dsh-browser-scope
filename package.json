@@ -42,8 +42,11 @@
     "assets",
     "cordis.patch.yml",
     "README.md",
+    "README.en.md",
     "TECHNICAL.md",
+    "TECHNICAL.en.md",
     "VALIDATION.md",
+    "VALIDATION.en.md",
     "LICENSE"
   ],
   "publishConfig": {

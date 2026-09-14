@@ -10,8 +10,11 @@ const packageName = 'dsh-browser-scope'
 const expectedVersion = '1.0.0-rc2'
 const expectedFiles = [
   'LICENSE',
+  'README.en.md',
   'README.md',
+  'TECHNICAL.en.md',
   'TECHNICAL.md',
+  'VALIDATION.en.md',
   'VALIDATION.md',
   'assets/browser-scope-debugger.png',
   'assets/browser-scope-diagnose-1.png',
