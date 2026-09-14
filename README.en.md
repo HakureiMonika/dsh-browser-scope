@@ -11,13 +11,17 @@ More than just viewing pages. Click, step through breakpoints, inspect network r
 ![Node](https://img.shields.io/badge/Node-%5E22.19.0%20%7C%7C%20%3E%3D24.0.0-16A34A?style=for-the-badge&logo=nodedotjs&logoColor=white)
 ![Status](https://img.shields.io/badge/status-Release%20Candidate-F97316?style=for-the-badge)
 
-[Quick Install](#installation) · [Visual Tour](#feature-highlights) · [30 Tools](#tool-reference) · [Validation](#validation-results) · [Technical Specs](./TECHNICAL.en.md) · [简体中文](./README.md)
+[Quick Install](#installation) · [Visual Tour](#feature-highlights) · [30 Tools](#tool-reference) · [Validation](#validation-results) · [Technical Specs](./TECHNICAL.en.md) <br> <br>
+The current language is English | [简体中文](./README.md)
 
 </div>
 
 ---
 
-![BrowserScope Live Workbench inside DSH Web](./assets/browser-scope-hero.png)
+> [!IMPORTANT]
+> This is an independent community plugin. It is not published, maintained, or endorsed by DeepSeek, and it does not modify DeepSeek Harness core packages.<br>
+> This plugin is still under development; if you encounter any **bugs** or unexpected issues, please report them to the developer via the issue tracker.
+>> *If it's useful, please stars let more people can see it~ Thanks♪(･ω･)ﾉ*
 
 ## Overview
 
@@ -26,6 +30,8 @@ What is the biggest pain point in frontend debugging? Invisible DOM trees, misse
 BrowserScope fundamentally changes this dynamic. It embeds a comprehensive Chromium workbench into the right sidebar of DSH Web, powered by 30 purpose-built automation tools. Agents can now directly inspect DOM nodes, interact with elements, review console logs, trace network requests, set breakpoints, read execution call stacks, resolve Source Maps, profile runtime performance, and preserve intact diagnostic evidence before and after interactions. From elementary clicks and scrolls to deep breakpoint inspection and bottleneck diagnosis, everything is handled natively within a single Session.
 
 Furthermore, BrowserScope ensures safe multi-plugin coexistence, tailored for DSH `0.1.5-rc.2`. Each formal Session selects its browser toolset upon first use (BrowserScope or existing third-party browser tools in the current profile). Once chosen, that Session remains permanently locked to that toolset, while other Sessions can choose independently. This prevents contaminated cross-plugin states, detached tabs, and conflicted authentication sessions.
+
+![BrowserScope Live Workbench inside DSH Web](./assets/browser-scope-hero.png)
 
 ## Table of Contents
 
