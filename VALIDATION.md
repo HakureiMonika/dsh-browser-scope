@@ -1,5 +1,7 @@
 # DSH BrowserScope 测试报告
 
+[English Version](./VALIDATION.en.md) | 简体中文
+
 本文记录 DSH BrowserScope 当前 Release Candidate 的测试目的、测试内容、测试过程和测试结果。
 
 候选状态以外部候选身份文件和 tarball 摘要为准。本文描述测试结果，不能单独证明某个版本已经完成 Git Tag、GitHub Release 或 npm 发布。

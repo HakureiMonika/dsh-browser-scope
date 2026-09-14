@@ -11,7 +11,7 @@
 ![Node](https://img.shields.io/badge/Node-%5E22.19.0%20%7C%7C%20%3E%3D24.0.0-16A34A?style=for-the-badge&logo=nodedotjs&logoColor=white)
 ![Status](https://img.shields.io/badge/status-Release%20Candidate-F97316?style=for-the-badge)
 
-[立即安装](#安装) · [看图了解](#能力展示) · [30 个工具](#功能介绍) · [测试结果](#能力测试结果) · [技术细节](./TECHNICAL.md)
+[立即安装](#安装) · [看图了解](#能力展示) · [30 个工具](#功能介绍) · [测试结果](#能力测试结果) · [技术细节](./TECHNICAL.md) · [English](./README.en.md)
 
 </div>
 
