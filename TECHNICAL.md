@@ -2,6 +2,8 @@
 
 [English Version](./TECHNICAL.en.md) | 简体中文
 
+当前版本 `1.0.0-rc3` 适配 DSH `0.1.5-rc.2` 和 `0.1.6-alpha.1`。
+
 本文说明 BrowserScope 的配置项、浏览器状态模型和安全边界。安装和功能概览见 [README](./README.md)，测试依据见 [测试报告](./VALIDATION.md)。
 
 ## 配置

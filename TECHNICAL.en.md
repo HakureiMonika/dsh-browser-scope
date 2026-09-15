@@ -2,6 +2,8 @@
 
 [简体中文](./TECHNICAL.md) | English Version
 
+Current release `1.0.0-rc3` targets DSH `0.1.5-rc.2` and `0.1.6-alpha.1`.
+
 This document describes the configuration options, browser state model, and security boundaries of BrowserScope. For general installation and feature overviews, see [README.en.md](./README.en.md). For test credentials, see [VALIDATION.en.md](./VALIDATION.en.md).
 
 ## Configuration

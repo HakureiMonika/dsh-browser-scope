@@ -295,7 +295,7 @@ dsh plugin --profile web add ./dsh-browser-scope-1.0.0-rc2.tgz --ignore-scripts 
 
 ## 兼容范围
 
-当前版本 `1.0.0-rc2` 适配 DSH `0.1.5-rc.2`，要求 Cordis `>=4.0.2 <5`、Schemastery `>=3.18.2 <4`。
+当前版本 `1.0.0-rc3` 适配 DSH `0.1.5-rc.2` 和 `0.1.6-alpha.1`，要求 Cordis `>=4.0.2 <5`、Schemastery `>=3.18.2 <4`。
 
 候选状态以外部 candidate-identity.json 和 tarball 摘要为准。
 

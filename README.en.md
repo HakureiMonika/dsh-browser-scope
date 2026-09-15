@@ -263,7 +263,7 @@ For comprehensive multi-environment empirical test results, see [VALIDATION.en.m
 
 ## Compatibility
 
-Current release `1.0.0-rc2` targets DSH `0.1.5-rc.2`, with requirements for Cordis `>=4.0.2 <5` and Schemastery `>=3.18.2 <4`.
+Current release `1.0.0-rc3` targets DSH `0.1.5-rc.2` and `0.1.6-alpha.1`, with requirements for Cordis `>=4.0.2 <5` and Schemastery `>=3.18.2 <4`。
 
 Candidate identity is anchored by external `candidate-identity.json` and tarball digest.
 
